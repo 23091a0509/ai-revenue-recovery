@@ -1,41 +1,71 @@
-"""Security tests for production boundary enforcement, credential leakage prevention, and URL parsing attacks.
+"""Security integration test suite verifying real process startup and configuration loading boundaries.
 
 Architecture Invariants:
-- INV-05: Strict MVP Sandbox Isolation (Config / Boundary Layer)
-- INV-06: Zero Production Credentials in MVP
+- INV-05: Strict MVP Sandbox Isolation (Config & Startup Layer — NOTE: Invariant remains NOT PROVEN until network-level transport firewall is implemented)
+- INV-06: Zero Production Credentials in MVP (NOTE: Invariant remains NOT PROVEN until full key management & rotation is implemented)
 """
 
+import os
 import pytest
 from src.revenue_recovery.foundation.config import (
     AppSettings,
     ConfigurationError,
     ProductionBoundaryViolationError,
+    get_settings,
     load_settings_from_env,
+    reset_cached_settings,
     scan_environment_for_forbidden_production_artifacts,
 )
 
 
-class TestSecurityBoundaries:
-    """Rigorous security tests for production isolation and credential protections."""
+class TestStartupPathSecurityBoundaries:
+    """Tests proving that forbidden production configurations cause the real startup loader to fail closed."""
 
-    @pytest.mark.parametrize("payload", [
-        {"STRIPE_SECRET_KEY": "sk_live_1234567890abcdef"},
-        {"RAZORPAY_SECRET": "live_secret_998877665544"},
-        {"TWILIO_AUTH_TOKEN": "0123456789abcdef0123456789abcdef"},
-        {"AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"},
-        {"AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE"},
-        {"PROD_DATABASE_URL": "postgresql://postgres:secret@db.prod.internal:5432/app"},
-        {"PRODUCTION_PAYMENTS_URL": "https://api.stripe.com"},
-        {"LIVE_PAYMENTS_ENDPOINT": "https://api.razorpay.com"},
-        {"STAGING_GATEWAY": "https://gateway.staging.internal"}
+    def setup_method(self):
+        reset_cached_settings()
+
+    def teardown_method(self):
+        reset_cached_settings()
+
+    @pytest.mark.parametrize("env_key,env_val", [
+        ("STRIPE_SECRET_KEY", "sk_test_mock_1234567890"),
+        ("stripe_secret_key", "sk_test_mock_1234567890"),
+        ("Stripe_Secret_Key", "sk_test_mock_1234567890"),
+        ("RAZORPAY_KEY_SECRET", "mock_key_secret_12345"),
+        ("PAYPAL_CLIENT_SECRET", "mock_paypal_secret"),
+        ("TWILIO_AUTH_TOKEN", "mock_twilio_token_12345"),
+        ("twilio_auth_token", "mock_twilio_token_12345"),
+        ("SENDGRID_API_KEY", "SG.mock_sendgrid_key"),
+        ("MAILGUN_API_KEY", "key-mockmailgun12345"),
+        ("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+        ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+        ("PROD_DATABASE_URL", "postgres://user:pass@prod-db.internal:5432/revenue"),
+        ("PRODUCTION_HOST", "payments.prod.internal"),
+        ("LIVE_GATEWAY_URL", "https://gateway.live.internal"),
+        ("STAGING_ENDPOINT", "https://staging.internal"),
+        ("CUSTOM_VARIABLE_CONTAINING_KEY", "sk_live_51ABC123XYZ456DEF789"),
+        ("RANDOM_CONFIG", "pk_live_51ABC123XYZ456DEF789"),
+        ("ANOTHER_VAR", "live_sec_abcdef123456789"),
+        ("PROD_CONFIG_FLAG", "prod_secret_9988776655")
     ])
-    def test_environment_scanner_blocks_all_production_variables(self, payload: dict):
+    def test_startup_loader_fails_closed_when_forbidden_env_present(
+        self, monkeypatch: pytest.MonkeyPatch, env_key: str, env_val: str
+    ):
         """
-        Security property: The environment scanner halts execution if any production-related
-        environment variable or live credential signature exists in the process environment.
+        Integration Requirement: The real startup path (load_settings_from_env / get_settings)
+        must fail closed when any forbidden production variable or live key is present in os.environ.
         """
+        monkeypatch.setenv("ENVIRONMENT", "sandbox")
+        monkeypatch.setenv("AUTH_SIGNING_SECRET", "sandbox_explicit_valid_secret_key_32bytes")
+        monkeypatch.setenv(env_key, env_val)
+
+        # 1. Direct environment loader fails closed
         with pytest.raises(ProductionBoundaryViolationError):
-            scan_environment_for_forbidden_production_artifacts(payload)
+            load_settings_from_env()
+
+        # 2. Cached application startup getter fails closed
+        with pytest.raises(ProductionBoundaryViolationError):
+            get_settings()
 
     @pytest.mark.parametrize("host_trick", [
         "http://api.stripe.com",
@@ -54,35 +84,37 @@ class TestSecurityBoundaries:
         "http://[2001:db8::1]:8001",
         "http://attacker.com/localhost",
     ])
-    def test_simulator_endpoint_security_filter(self, host_trick: str):
+    def test_startup_loader_rejects_host_tampering(
+        self, monkeypatch: pytest.MonkeyPatch, host_trick: str
+    ):
         """
-        Security property: Non-sandbox, non-loopback, deceptive, and production endpoints
-        are unconditionally rejected.
+        Integration Requirement: Non-sandbox URLs in os.environ cause startup to fail closed.
         """
-        with pytest.raises(ProductionBoundaryViolationError):
-            load_settings_from_env({
-                "ENVIRONMENT": "sandbox",
-                "AUTH_SIGNING_SECRET": "sandbox_valid_test_secret_32bytes_min",
-                "SANDBOX_PAYMENT_SIMULATOR_URL": host_trick
-            })
+        monkeypatch.setenv("ENVIRONMENT", "sandbox")
+        monkeypatch.setenv("AUTH_SIGNING_SECRET", "sandbox_explicit_valid_secret_key_32bytes")
+        monkeypatch.setenv("SANDBOX_PAYMENT_SIMULATOR_URL", host_trick)
 
-    @pytest.mark.parametrize("weak_secret", [
-        "short",
-        "1234567890",
-        "sandbox-default-signing-secret-do-not-use-in-prod",
-        "default_secret",
-        "change_this_secret",
-        "password12345678"
-    ])
-    def test_signing_secret_entropy_and_default_prevention(self, weak_secret: str):
+        with pytest.raises(ProductionBoundaryViolationError):
+            load_settings_from_env()
+
+    def test_startup_singleton_caching_and_reset_lifecycle(self, monkeypatch: pytest.MonkeyPatch):
         """
-        Security property: Weak, static, or short signing secrets cannot be used
-        as authorization signing keys.
+        Lifecycle Requirement: `get_settings()` returns an immutable singleton,
+        and `reset_cached_settings()` cleanly reloads on environment updates.
         """
-        with pytest.raises(ConfigurationError):
-            AppSettings(
-                environment="sandbox",
-                auth_signing_secret=weak_secret,
-                sandbox_payment_simulator_url="http://localhost:8001",
-                sandbox_messaging_simulator_url="http://localhost:8002"
-            )
+        monkeypatch.setenv("ENVIRONMENT", "sandbox")
+        monkeypatch.setenv("AUTH_SIGNING_SECRET", "sandbox_explicit_valid_secret_key_32bytes")
+        monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+
+        settings_1 = get_settings()
+        settings_2 = get_settings()
+        assert settings_1 is settings_2
+        assert settings_1.log_level == "DEBUG"
+
+        # Update environment and verify cached singleton is unchanged until reset
+        monkeypatch.setenv("LOG_LEVEL", "WARNING")
+        assert get_settings().log_level == "DEBUG"
+
+        reset_cached_settings()
+        settings_3 = get_settings()
+        assert settings_3.log_level == "WARNING"

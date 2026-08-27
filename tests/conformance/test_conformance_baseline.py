@@ -1,24 +1,32 @@
-"""Conformance test suite verifying that the 18 v11 architectural invariants are tracked and baseline is uncompromised."""
+"""Conformance documentation integrity test suite.
+
+IMPORTANT:
+This test suite verifies the documentation integrity of docs/architecture/conformance_matrix.md
+(ensuring that all 18 invariants are explicitly mapped and none are prematurely claimed as PROVEN).
+
+THIS TEST DOES NOT PROVE THAT THE 18 ARCHITECTURAL INVARIANTS ARE IMPLEMENTED.
+All 18 invariants remain NOT PROVEN until their respective implementation and lifecycle evidence are complete.
+"""
 
 from pathlib import Path
 
 
-def test_conformance_matrix_tracks_all_18_invariants_as_not_proven():
+def test_conformance_matrix_documentation_integrity():
     """
-    Conformance Verification:
-    Asserts that docs/architecture/conformance_matrix.md tracks all 18 invariants
-    and none are falsely marked PROVEN before their full lifecycle evidence exists.
+    Documentation Integrity Check:
+    Verifies that the conformance matrix file exists, tracks all 18 invariants,
+    and maintains the baseline state of 0 PROVEN / 18 NOT PROVEN.
     """
     matrix_path = Path(__file__).parent.parent.parent / "docs" / "architecture" / "conformance_matrix.md"
-    assert matrix_path.exists(), "Conformance matrix file must exist"
+    assert matrix_path.exists(), "Conformance matrix file must exist at docs/architecture/conformance_matrix.md"
     
     content = matrix_path.read_text(encoding="utf-8")
     
-    # Verify all 18 invariants are present
+    # Assert all 18 invariant IDs are present in the table
     for i in range(1, 19):
         inv_id = f"INV-{i:02d}"
-        assert inv_id in content, f"Conformance matrix missing invariant {inv_id}"
+        assert inv_id in content, f"Conformance matrix missing invariant tracking entry for {inv_id}"
     
-    # Verify summary strictly reports PROVEN = 0
-    assert "- **PROVEN:** 0" in content, "Conformance matrix must not claim proven invariants prematurely"
-    assert "- **NOT PROVEN:** 18" in content, "All 18 invariants must remain NOT PROVEN at current baseline"
+    # Assert baseline status count
+    assert "- **PROVEN:** 0" in content, "Baseline must report 0 PROVEN"
+    assert "- **NOT PROVEN:** 18" in content, "Baseline must report 18 NOT PROVEN"
