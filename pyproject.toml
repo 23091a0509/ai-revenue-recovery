@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
-    {name = "Revenue Recovery Team"}
+    {name = "Shaik Aman", email = "23091a0509@rgmcet.edu.in"}
 ]
 dependencies = [
     "pydantic>=2.0",
@@ -35,5 +35,6 @@ line-length = 100
 target-version = "py311"
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
