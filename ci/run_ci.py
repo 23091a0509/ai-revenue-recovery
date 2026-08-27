@@ -10,7 +10,7 @@ import subprocess
 
 def run_command(command: list[str], description: str) -> int:
     print(f"\n[CI] Running: {description} ({' '.join(command)})...")
-    result = subprocess.run(command, capture_output=False)
+    result = subprocess.run(command)
     if result.returncode != 0:
         print(f"[CI ERROR] {description} failed with exit code {result.returncode}!")
     else:
@@ -19,22 +19,37 @@ def run_command(command: list[str], description: str) -> int:
 
 
 def main() -> int:
-    print("=" * 60)
-    print("AI Revenue Recovery — CI & Security Validation Pipeline")
-    print("=" * 60)
+    print("=" * 70)
+    print("AI Revenue Recovery — Full CI & Conformance Pipeline")
+    print("=" * 70)
 
-    # 1. Run full test suite with coverage
-    test_code = run_command(
+    # 1. Run unit tests
+    unit_code = run_command(
         [sys.executable, "-m", "pytest", "tests/unit/", "-v"],
-        "Pytest Unit and Adversarial Test Suite"
+        "Unit and Safeguard Test Suite (tests/unit/)"
     )
+    if unit_code != 0:
+        return unit_code
 
-    if test_code != 0:
-        return test_code
+    # 2. Run dedicated security tests
+    sec_code = run_command(
+        [sys.executable, "-m", "pytest", "tests/security/", "-v"],
+        "Security & Boundary Test Suite (tests/security/)"
+    )
+    if sec_code != 0:
+        return sec_code
 
-    print("\n" + "=" * 60)
-    print("[CI SUMMARY] All automated security and unit tests PASSED.")
-    print("=" * 60)
+    # 3. Run architecture conformance tests
+    conf_code = run_command(
+        [sys.executable, "-m", "pytest", "tests/conformance/", "-v"],
+        "Architecture Conformance Test Suite (tests/conformance/)"
+    )
+    if conf_code != 0:
+        return conf_code
+
+    print("\n" + "=" * 70)
+    print("[CI SUMMARY] All Unit, Security, and Conformance Test Suites PASSED.")
+    print("=" * 70)
     return 0
 
 
