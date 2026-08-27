@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-revenue-recovery"
+version = "0.1.0"
+description = "AI-powered, bounded revenue recovery system based on Frozen Architecture Baseline v11"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Revenue Recovery Team"}
+]
+dependencies = [
+    "pydantic>=2.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.27.0",
+    "cryptography>=42.0.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "black>=24.0.0",
+    "ruff>=0.3.0",
+    "mypy>=1.9.0"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
