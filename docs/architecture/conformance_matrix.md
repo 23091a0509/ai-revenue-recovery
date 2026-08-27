@@ -16,7 +16,7 @@
 | **INV-03** | Capability-based Action Authorization | Cryptographically signed `ActionAuthorization` with TTL, amount, case, and channel | `src/revenue_recovery/safety/authorizer.py` | `tests/unit/test_authorizer.py`, `tests/security/test_token_tampering.py` | 🔴 **NOT PROVEN** |
 | **INV-04** | Executor acts ONLY on valid signed token | Token signature, expiry, and scope validation before any execution call | `src/revenue_recovery/executor/executor.py` | `tests/unit/test_executor.py`, `tests/security/test_unsigned_execution_rejected.py` | 🔴 **NOT PROVEN** |
 | **INV-05** | Strict MVP Sandbox Isolation | Egress allowlist validation; refusal of non-sandbox URIs | `src/revenue_recovery/executor/sandbox_guard.py` | `tests/conformance/test_sandbox_isolation.py` | 🔴 **NOT PROVEN** |
-| **INV-06** | Zero production credentials in MVP | Config validator fails startup if production API keys/URIs present | `src/revenue_recovery/foundation/config.py` | `tests/unit/test_config_validation.py` | 🔴 **NOT PROVEN** |
+| **INV-06** | Zero production credentials in MVP | Config validator fails startup if production API keys/URIs present | `src/revenue_recovery/foundation/config.py` | `tests/unit/test_config.py` | 🟢 **PROVEN** |
 | **INV-07** | Mandatory compliance obligations cannot be discarded | Deterministic Scheduler prioritizes mandatory disclosures over optional recovery | `src/revenue_recovery/governance/scheduler.py` | `tests/unit/test_compliance_scheduler.py` | 🔴 **NOT PROVEN** |
 | **INV-08** | Multi-way obligation collision resolution | Deterministic precedence arbitration with legal safety fallbacks | `src/revenue_recovery/governance/scheduler.py` | `tests/unit/test_multiway_collisions.py` | 🔴 **NOT PROVEN** |
 | **INV-09** | Safety freezes cannot be bypassed via retry | Frozen state in DB & Arbitrator rejects retries on safety trip | `src/revenue_recovery/governance/arbitrator.py` | `tests/unit/test_arbitrator_freeze.py` | 🔴 **NOT PROVEN** |
@@ -34,6 +34,6 @@
 
 ## Conformance Summary
 - **Total Invariants Mapped:** 18
-- **PROVEN:** 0
+- **PROVEN:** 1 (INV-06)
 - **IN PROGRESS:** 0
-- **NOT PROVEN:** 18 (Current baseline status)
+- **NOT PROVEN:** 17
