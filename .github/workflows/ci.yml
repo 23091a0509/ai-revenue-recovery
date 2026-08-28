@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+  statuses: write
+  checks: write
+
 jobs:
   test:
     name: Run Unit, Security & Conformance Test Suites
@@ -30,3 +35,19 @@ jobs:
       - name: Execute Full Test Suites
         run: |
           pytest -v tests/unit/ tests/security/ tests/conformance/
+
+      - name: Report Combined Commit Status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            STATE="success"
+            DESC="All 104 unit, security, and conformance tests passed"
+          else
+            STATE="failure"
+            DESC="CI test execution failed"
+          fi
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }} \
+            -d "{\"state\": \"$STATE\", \"target_url\": \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\", \"description\": \"$DESC\", \"context\": \"ci/tests\"}"
