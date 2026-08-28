@@ -33,18 +33,19 @@ jobs:
           pip install -e .[dev]
 
       - name: Execute Full Test Suites
+        id: test_run
         run: |
           pytest -v tests/unit/ tests/security/ tests/conformance/
 
       - name: Report Combined Commit Status
         if: always()
         run: |
-          if [ "${{ job.status }}" = "success" ]; then
+          if [ "${{ steps.test_run.outcome }}" = "success" ]; then
             STATE="success"
-            DESC="All 104 unit, security, and conformance tests passed"
+            DESC="Unit, security, and conformance test suites passed"
           else
             STATE="failure"
-            DESC="CI test execution failed"
+            DESC="CI test suite execution failed"
           fi
           curl -s -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
