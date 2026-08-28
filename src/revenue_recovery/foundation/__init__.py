@@ -5,8 +5,10 @@ from src.revenue_recovery.foundation.audit import (
     AuditEntry,
     AuditIntegrityError,
     CryptographicAuditLogger,
+    ImmutableDict,
     canonical_json,
     compute_entry_hash,
+    freeze_payload,
 )
 from src.revenue_recovery.foundation.config import (
     AppSettings,
@@ -62,6 +64,8 @@ __all__ = [
     "AuditEntry",
     "AuditIntegrityError",
     "CryptographicAuditLogger",
+    "ImmutableDict",
     "canonical_json",
     "compute_entry_hash",
+    "freeze_payload",
 ]
