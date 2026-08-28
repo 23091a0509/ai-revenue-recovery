@@ -1,5 +1,13 @@
 """Foundation layer: Configuration, Security Safeguards, and Core Domain Contracts."""
 
+from src.revenue_recovery.foundation.audit import (
+    GENESIS_PREVIOUS_HASH,
+    AuditEntry,
+    AuditIntegrityError,
+    CryptographicAuditLogger,
+    canonical_json,
+    compute_entry_hash,
+)
 from src.revenue_recovery.foundation.config import (
     AppSettings,
     ConfigurationError,
@@ -49,4 +57,11 @@ __all__ = [
     "RecoveryCase",
     "ComplianceObligation",
     "DomainEventEnvelope",
+    # Cryptographic Audit
+    "GENESIS_PREVIOUS_HASH",
+    "AuditEntry",
+    "AuditIntegrityError",
+    "CryptographicAuditLogger",
+    "canonical_json",
+    "compute_entry_hash",
 ]
