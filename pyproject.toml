@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
-    {name = "Shaik Aman", email = "23091a0509@rgmcet.edu.in"}
+    {name = "Revenue Recovery Team"}
 ]
 dependencies = [
     "pydantic>=2.0",
