@@ -22,6 +22,22 @@ from src.revenue_recovery.foundation.events import (
 )
 
 
+class TestFoundationPublicExports:
+    """Tests verifying public exports from src.revenue_recovery.foundation."""
+
+    def test_obligation_type_exported_from_foundation(self):
+        """Proves that ObligationType is correctly exported and importable from the foundation root."""
+        from src.revenue_recovery.foundation import ObligationType as FoundationObligationType
+        assert FoundationObligationType is ObligationType
+        assert FoundationObligationType.COOLING_OFF.value == "COOLING_OFF"
+
+    def test_all_declared_exports_importable(self):
+        """Proves that every symbol declared in foundation.__all__ actually exists and is exported."""
+        import src.revenue_recovery.foundation as foundation
+        for symbol in foundation.__all__:
+            assert hasattr(foundation, symbol), f"Symbol '{symbol}' declared in __all__ but not exported"
+
+
 class TestCoreDomainEnums:
     """Tests verifying required lifecycle states, action types, and failure reasons."""
 

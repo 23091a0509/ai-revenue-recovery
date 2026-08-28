@@ -19,6 +19,7 @@ from src.revenue_recovery.foundation.events import (
     ExecutionStatus,
     FailureReason,
     ImmutableBaseModel,
+    ObligationType,
     PaymentFailureEvent,
     RecoveryCase,
     RiskTier,
