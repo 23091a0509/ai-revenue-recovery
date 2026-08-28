@@ -7,13 +7,20 @@ bounded, and time-expiring Authorization tokens.
 
 from datetime import datetime, timezone
 from enum import Enum
-import hmac
 import hashlib
+import hmac
 from typing import Any
+from urllib.parse import urlparse
 import uuid
 from pydantic import Field, field_validator
 
-from src.revenue_recovery.foundation.config import get_settings
+from src.revenue_recovery.foundation.config import (
+    PRODUCTION_KEY_PATTERNS,
+    AppSettings,
+    ConfigurationError,
+    ProductionBoundaryViolationError,
+    get_settings,
+)
 from src.revenue_recovery.foundation.events import (
     ActionChannel,
     ActionType,
@@ -32,6 +39,44 @@ class AuthorizationStatus(str, Enum):
 class AuthorizationVerificationError(Exception):
     """Raised when an authorization token fails signature, bounds, or expiry verification."""
     pass
+
+
+def validate_authorizer_signing_secret(v: str) -> str:
+    """
+    Validates that an injected signing secret meets the strict cryptographic and security requirements.
+    Rejects empty, whitespace, short (< 16 chars), static weak defaults, and production credentials.
+    """
+    if not isinstance(v, str) or not v or not v.strip():
+        raise ConfigurationError("Signing secret cannot be empty or blank.")
+    
+    v_clean = v.strip()
+    if len(v_clean) < 16:
+        raise ConfigurationError(
+            f"Signing secret is too short ({len(v_clean)} chars); minimum required length is 16 characters."
+        )
+
+    weak_defaults = {
+        "sandbox-default-signing-secret-do-not-use-in-prod",
+        "default_secret",
+        "secret1234567890",
+        "change_this_secret",
+        "password12345678",
+        "1234567890123456",
+        "abcdefghijklmnop",
+        "qwertyuiopasdfgh"
+    }
+    if v_clean.lower() in weak_defaults:
+        raise ConfigurationError(
+            "Static weak default signing secret detected. A strong, random sandbox secret must be configured."
+        )
+
+    for pat in PRODUCTION_KEY_PATTERNS:
+        if pat.match(v_clean):
+            raise ProductionBoundaryViolationError(
+                "Production boundary violation: Detected live/production credential format in signing secret."
+            )
+
+    return v_clean
 
 
 def canonical_signing_string(
@@ -101,10 +146,11 @@ class CryptographicAuthorizer:
 
     def __init__(self, signing_secret: str | None = None) -> None:
         if signing_secret is not None:
-            self._signing_secret = signing_secret.encode("utf-8")
+            validated_secret = validate_authorizer_signing_secret(signing_secret)
+            self._signing_secret = validated_secret.encode("utf-8")
         else:
             settings = get_settings()
-            self._signing_secret = settings.signing_secret.get_secret_value().encode("utf-8")
+            self._signing_secret = settings.auth_signing_secret.encode("utf-8")
 
     def _compute_signature(self, canonical_str: str) -> str:
         """Computes HMAC-SHA256 signature over the canonical authorization string."""
@@ -122,11 +168,19 @@ class CryptographicAuthorizer:
         decision_id: str,
         expires_at: datetime,
         idempotency_key: str,
-        authorization_id: str | None = None
+        authorization_id: str | None = None,
+        current_time: datetime | None = None
     ) -> ActionAuthorization:
         """
         Mints a new, cryptographically signed ActionAuthorization token.
+        Fails closed if the provided expires_at is not strictly in the future.
         """
+        now = current_time or datetime.now(timezone.utc)
+        if expires_at <= now:
+            raise ValueError(
+                f"Token expiration must be strictly in the future: expires_at ({expires_at.isoformat()}) <= now ({now.isoformat()})"
+            )
+
         auth_id = authorization_id or str(uuid.uuid4())
         action_type_val = action_type.value if hasattr(action_type, "value") else str(action_type)
         channel_val = channel.value if hasattr(channel, "value") else str(channel)

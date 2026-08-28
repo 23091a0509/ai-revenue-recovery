@@ -6,6 +6,7 @@ from src.revenue_recovery.safety.authorizer import (
     AuthorizationVerificationError,
     CryptographicAuthorizer,
     canonical_signing_string,
+    validate_authorizer_signing_secret,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "AuthorizationVerificationError",
     "CryptographicAuthorizer",
     "canonical_signing_string",
+    "validate_authorizer_signing_secret",
 ]
