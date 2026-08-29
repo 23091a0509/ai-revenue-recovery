@@ -1,8 +1,15 @@
 """Executor package for AI Revenue Recovery MVP.
 
-Provides sandbox egress firewall, action execution abstractions, and simulator integration.
+Provides sandbox egress firewall, authoritative idempotent action executor, and simulator integrations.
 """
 
+from src.revenue_recovery.executor.executor import (
+    ActionExecutor,
+    ExecutionResult,
+    IdempotencyConflictError,
+    IdempotencyStore,
+    SandboxActionHandler,
+)
 from src.revenue_recovery.executor.sandbox_guard import (
     EgressVerdict,
     SandboxGuard,
@@ -11,6 +18,11 @@ from src.revenue_recovery.executor.sandbox_guard import (
 )
 
 __all__ = [
+    "ActionExecutor",
+    "ExecutionResult",
+    "IdempotencyConflictError",
+    "IdempotencyStore",
+    "SandboxActionHandler",
     "EgressVerdict",
     "SandboxGuard",
     "SandboxViolationError",
