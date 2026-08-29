@@ -1,12 +1,17 @@
-"""Milestone 2 consolidated unit and security tests (TICKET-08).
+"""Milestone 2 unit and security tests (TICKET-08).
 
 Architecture Baseline: Frozen Architecture Baseline v11.
-Proves end-to-end Execution Safety subsystem integration across CryptographicAuthorizer,
-KillSwitchManager, CircuitBreaker, and CapacityGovernor under normal and adversarial conditions.
+Verification Scope:
+Proves component-level and contract-level safety pipeline composition across
+CryptographicAuthorizer, KillSwitchManager, CircuitBreaker, and CapacityGovernor.
+Demonstrates short-circuit evaluation order, fail-closed isolation, and adversarial token tampering defense.
+
+NOTE: This suite exercises a simulated/contract-level composition of Milestone 2 safety components.
+Actual production Executor enforcement and runtime integration are tested in TICKET-10.
 """
 
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 import pytest
 
 from src.revenue_recovery.foundation.events import (
@@ -34,13 +39,17 @@ from src.revenue_recovery.safety import (
 )
 
 
-class TestMilestone2SafetyIntegrationPipeline:
+class TestMilestone2SimulatedSafetyPipeline:
     """
-    Tests the multi-layer execution safety pipeline in strict sequence:
+    Contract-level simulated safety pipeline testing.
+    Verifies that the four execution safety gates compose in strict short-circuit sequence:
     1. Cryptographic Token Verification
     2. Kill Switch Gate
     3. Circuit Breaker Gate
     4. Capacity Governor Gate
+
+    Proves that failure at any upstream gate immediately halts processing and
+    guarantees downstream safety gates are NOT reached or state-mutated.
     """
 
     @pytest.fixture
@@ -63,7 +72,7 @@ class TestMilestone2SafetyIntegrationPipeline:
     def capacity_governor(self) -> CapacityGovernor:
         return CapacityGovernor(max_actions_per_window=10, max_volume_in_cents_per_window=100000, window_seconds=60.0)
 
-    def _execute_safety_gate(
+    def _execute_simulated_pipeline(
         self,
         token: ActionAuthorization,
         authorizer: CryptographicAuthorizer,
@@ -75,8 +84,8 @@ class TestMilestone2SafetyIntegrationPipeline:
         current_time: datetime | None = None
     ) -> SafetyVerdict:
         """
-        Simulates the authoritative safety evaluation pipeline.
-        Returns SafetyVerdict.PASS only if all 4 gates permit execution.
+        Simulated/contract-level safety evaluation pipeline.
+        Enforces strict fail-closed short-circuit ordering.
         """
         now = current_time or datetime.now(timezone.utc)
 
@@ -106,7 +115,7 @@ class TestMilestone2SafetyIntegrationPipeline:
 
         return SafetyVerdict.PASS
 
-    def test_all_gates_pass_under_healthy_conditions(
+    def test_healthy_execution_passes_all_four_gates(
         self,
         authorizer: CryptographicAuthorizer,
         kill_switch: KillSwitchManager,
@@ -128,7 +137,7 @@ class TestMilestone2SafetyIntegrationPipeline:
             current_time=t0
         )
 
-        verdict = self._execute_safety_gate(
+        verdict = self._execute_simulated_pipeline(
             token=token,
             authorizer=authorizer,
             kill_switch=kill_switch,
@@ -140,17 +149,18 @@ class TestMilestone2SafetyIntegrationPipeline:
         )
         assert verdict == SafetyVerdict.PASS
 
-        # Capacity was reserved
+        # Verified downstream capacity was recorded
         count, vol = capacity_governor.get_current_utilization(current_time=t0)
         assert count == 1
         assert vol == 5000
 
-    def test_tampered_token_fails_closed_before_touching_downstream_gates(
+    def test_short_circuit_tampered_token_stops_before_kill_switch_and_downstream(
         self,
         authorizer: CryptographicAuthorizer,
         kill_switch: KillSwitchManager,
         circuit_breakers: GranularCircuitBreakerRegistry,
-        capacity_governor: CapacityGovernor
+        capacity_governor: CapacityGovernor,
+        monkeypatch
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         token = authorizer.mint_authorization(
@@ -167,11 +177,20 @@ class TestMilestone2SafetyIntegrationPipeline:
             current_time=t0
         )
 
-        # Attacker tampers with signature
+        # Tamper with signature
         tampered_token = token.model_copy(update={"signature": "bad0000000000000000000000000000000000000000000000000000000000000"})
 
+        # Spy on downstream gates to prove they are never reached
+        kill_switch_spy = MagicMock(side_effect=kill_switch.check_execution_allowed)
+        circuit_breaker_spy = MagicMock(side_effect=circuit_breakers.check_execution_allowed)
+        capacity_spy = MagicMock(side_effect=capacity_governor.record_action)
+
+        monkeypatch.setattr(kill_switch, "check_execution_allowed", kill_switch_spy)
+        monkeypatch.setattr(circuit_breakers, "check_execution_allowed", circuit_breaker_spy)
+        monkeypatch.setattr(capacity_governor, "record_action", capacity_spy)
+
         with pytest.raises(AuthorizationVerificationError, match="Cryptographic signature mismatch"):
-            self._execute_safety_gate(
+            self._execute_simulated_pipeline(
                 token=tampered_token,
                 authorizer=authorizer,
                 kill_switch=kill_switch,
@@ -182,17 +201,23 @@ class TestMilestone2SafetyIntegrationPipeline:
                 current_time=t0
             )
 
-        # Capacity was NOT reserved
+        # Assert zero downstream invocations
+        assert kill_switch_spy.call_count == 0
+        assert circuit_breaker_spy.call_count == 0
+        assert capacity_spy.call_count == 0
+
+        # Downstream capacity remains untouched
         count, vol = capacity_governor.get_current_utilization(current_time=t0)
         assert count == 0
         assert vol == 0
 
-    def test_kill_switch_fails_closed_before_circuit_breaker_and_capacity(
+    def test_short_circuit_kill_switch_stops_before_circuit_breaker_and_capacity(
         self,
         authorizer: CryptographicAuthorizer,
         kill_switch: KillSwitchManager,
         circuit_breakers: GranularCircuitBreakerRegistry,
-        capacity_governor: CapacityGovernor
+        capacity_governor: CapacityGovernor,
+        monkeypatch
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         token = authorizer.mint_authorization(
@@ -212,8 +237,15 @@ class TestMilestone2SafetyIntegrationPipeline:
         # Activate customer-specific kill switch
         kill_switch.activate_customer("cust_200", reason="Legal freeze", activated_by="compliance_officer")
 
+        # Spy on circuit breaker and capacity governor
+        circuit_breaker_spy = MagicMock(side_effect=circuit_breakers.check_execution_allowed)
+        capacity_spy = MagicMock(side_effect=capacity_governor.record_action)
+
+        monkeypatch.setattr(circuit_breakers, "check_execution_allowed", circuit_breaker_spy)
+        monkeypatch.setattr(capacity_governor, "record_action", capacity_spy)
+
         with pytest.raises(KillSwitchActiveError, match="Execution halted by CUSTOMER kill switch"):
-            self._execute_safety_gate(
+            self._execute_simulated_pipeline(
                 token=token,
                 authorizer=authorizer,
                 kill_switch=kill_switch,
@@ -224,17 +256,22 @@ class TestMilestone2SafetyIntegrationPipeline:
                 current_time=t0
             )
 
+        # Assert circuit breaker and capacity governor were NOT called
+        assert circuit_breaker_spy.call_count == 0
+        assert capacity_spy.call_count == 0
+
         # Downstream capacity remains untouched
         count, vol = capacity_governor.get_current_utilization(current_time=t0)
         assert count == 0
         assert vol == 0
 
-    def test_circuit_breaker_fails_closed_before_capacity_consumption(
+    def test_short_circuit_circuit_breaker_stops_before_capacity_consumption(
         self,
         authorizer: CryptographicAuthorizer,
         kill_switch: KillSwitchManager,
         circuit_breakers: GranularCircuitBreakerRegistry,
-        capacity_governor: CapacityGovernor
+        capacity_governor: CapacityGovernor,
+        monkeypatch
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         token = authorizer.mint_authorization(
@@ -255,8 +292,12 @@ class TestMilestone2SafetyIntegrationPipeline:
         circuit_breakers.record_failure(ActionChannel.DIRECT_PAYMENT_GATEWAY, current_time=t0)
         circuit_breakers.record_failure(ActionChannel.DIRECT_PAYMENT_GATEWAY, current_time=t0)
 
+        # Spy on capacity governor
+        capacity_spy = MagicMock(side_effect=capacity_governor.record_action)
+        monkeypatch.setattr(capacity_governor, "record_action", capacity_spy)
+
         with pytest.raises(CircuitBrokenError, match="is OPEN and blocking execution"):
-            self._execute_safety_gate(
+            self._execute_simulated_pipeline(
                 token=token,
                 authorizer=authorizer,
                 kill_switch=kill_switch,
@@ -267,7 +308,10 @@ class TestMilestone2SafetyIntegrationPipeline:
                 current_time=t0
             )
 
-        # Capacity was NOT consumed
+        # Assert capacity governor was NOT called
+        assert capacity_spy.call_count == 0
+
+        # Downstream capacity remains untouched
         count, vol = capacity_governor.get_current_utilization(current_time=t0)
         assert count == 0
         assert vol == 0
@@ -296,7 +340,7 @@ class TestMilestone2SafetyIntegrationPipeline:
         )
 
         with pytest.raises(CapacityExceededError, match="Monetary volume limit exceeded"):
-            self._execute_safety_gate(
+            self._execute_simulated_pipeline(
                 token=token,
                 authorizer=authorizer,
                 kill_switch=kill_switch,
@@ -307,7 +351,7 @@ class TestMilestone2SafetyIntegrationPipeline:
                 current_time=t0
             )
 
-        # Utilization remains 0 because request was rejected atomically
+        # Capacity utilization remains 0 because request was rejected atomically
         count, vol = capacity_governor.get_current_utilization(current_time=t0)
         assert count == 0
         assert vol == 0
