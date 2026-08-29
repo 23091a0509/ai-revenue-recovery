@@ -2,7 +2,7 @@
 
 Architecture Baseline: Frozen Architecture Baseline v11.
 Provides automatic fault isolation via 3-state Circuit Breaker (CLOSED, OPEN, HALF_OPEN)
-with controlled concurrency probe limiting and sliding-window rate and volume limiting via CapacityGovernor.
+with atomic probe admission concurrency control and sliding-window rate and volume limiting via CapacityGovernor.
 """
 
 from collections import deque
@@ -54,7 +54,7 @@ class CapacityExceededError(Exception):
 
 class CircuitBreaker:
     """
-    Thread-safe, fail-closed 3-state Circuit Breaker with controlled HALF_OPEN probe concurrency.
+    Thread-safe, fail-closed 3-state Circuit Breaker with atomic HALF_OPEN probe admission.
     """
 
     def __init__(
@@ -109,34 +109,24 @@ class CircuitBreaker:
                 self._half_open_successes = 0
                 self._active_half_open_probes = 0
 
-    def check_execution_allowed(self, current_time: datetime | None = None) -> bool:
+    def can_attempt_probe(self, current_time: datetime | None = None) -> bool:
         """
-        Fail-closed check without reserving probe capacity.
+        Pure read-only query (does not claim probe capacity).
         Returns True if CLOSED or HALF_OPEN with available probe capacity.
-        Raises CircuitBrokenError if OPEN or if HALF_OPEN probe capacity is saturated.
+        Returns False if OPEN or if HALF_OPEN probe capacity is saturated.
         """
         with self._lock:
             self._evaluate_state_transition(current_time)
             if self._state == CircuitBreakerState.OPEN:
-                raise CircuitBrokenError(
-                    message=f"Circuit breaker for target '{self.target}' is OPEN and blocking execution",
-                    target=self.target,
-                    state=self._state,
-                    tripped_at=self._tripped_at
-                )
+                return False
             if self._state == CircuitBreakerState.HALF_OPEN:
-                if self._active_half_open_probes >= self.half_open_max_probes:
-                    raise CircuitBrokenError(
-                        message=f"Circuit breaker for target '{self.target}' is in HALF_OPEN state and active probe limit ({self.half_open_max_probes}) is reached",
-                        target=self.target,
-                        state=self._state,
-                        tripped_at=self._tripped_at
-                    )
+                return self._active_half_open_probes < self.half_open_max_probes
             return True
 
-    def acquire_execution_permission(self, current_time: datetime | None = None) -> bool:
+    def check_execution_allowed(self, current_time: datetime | None = None) -> bool:
         """
-        Atomically checks and acquires execution permission.
+        Canonical fail-closed execution admission gate.
+        Atomically checks state and acquires probe capacity when in HALF_OPEN.
         In CLOSED state: permits execution.
         In HALF_OPEN state: atomically increments active probe count if under limit; otherwise fails closed.
         In OPEN state: raises CircuitBrokenError.
@@ -160,6 +150,10 @@ class CircuitBreaker:
                     )
                 self._active_half_open_probes += 1
             return True
+
+    def acquire_execution_permission(self, current_time: datetime | None = None) -> bool:
+        """Alias for check_execution_allowed() ensuring unambiguous admission semantics."""
+        return self.check_execution_allowed(current_time)
 
     def record_success(self, current_time: datetime | None = None) -> None:
         """Records a successful operation, restoring CLOSED state if threshold met in HALF_OPEN."""
@@ -198,7 +192,7 @@ class CircuitBreaker:
                     self._active_half_open_probes = 0
 
     def release_probe(self) -> None:
-        """Decrements active half-open probe count if an acquired probe was cancelled/aborted."""
+        """Decrements active half-open probe count if an admitted probe was cancelled/aborted."""
         with self._lock:
             if self._state == CircuitBreakerState.HALF_OPEN and self._active_half_open_probes > 0:
                 self._active_half_open_probes -= 1
@@ -323,7 +317,8 @@ class CapacityGovernor:
 
     def check_capacity_available(self, requested_amount_in_cents: int = 0, current_time: datetime | None = None) -> bool:
         """
-        Fail-closed check. Returns True if allowable without reserving capacity.
+        Fail-closed check without reserving capacity.
+        Returns True if allowable.
         Raises CapacityExceededError if adding the requested action would exceed count or volume bounds.
         """
         if requested_amount_in_cents < 0:

@@ -1,8 +1,8 @@
 """Unit and concurrency tests for fail-closed Circuit Breaker and Capacity Governor (TICKET-07).
 
 Architecture Baseline: Frozen Architecture Baseline v11.
-Proves 3-state state machine transitions, deterministic HALF_OPEN probe concurrency control,
-and thread-safe atomic capacity reservation.
+Proves 3-state state machine transitions, atomic HALF_OPEN probe admission via check_execution_allowed(),
+read-only inspection via can_attempt_probe(), and thread-safe atomic capacity reservation.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +27,7 @@ class TestCircuitBreaker:
     def test_initial_state_is_closed(self):
         cb = CircuitBreaker(target="gateway_test", failure_threshold=3, recovery_timeout_seconds=10.0)
         assert cb.state == CircuitBreakerState.CLOSED
+        assert cb.can_attempt_probe() is True
         assert cb.check_execution_allowed() is True
         assert cb.acquire_execution_permission() is True
 
@@ -43,6 +44,7 @@ class TestCircuitBreaker:
         # 3rd failure trips to OPEN
         cb.record_failure(current_time=t0)
         assert cb.get_state(current_time=t0) == CircuitBreakerState.OPEN
+        assert cb.can_attempt_probe(current_time=t0) is False
 
         # OPEN state fails closed
         with pytest.raises(CircuitBrokenError) as exc_info:
@@ -76,28 +78,29 @@ class TestCircuitBreaker:
         with pytest.raises(CircuitBrokenError):
             cb.check_execution_allowed(current_time=t_before)
         assert cb.get_state(current_time=t_before) == CircuitBreakerState.OPEN
+        assert cb.can_attempt_probe(current_time=t_before) is False
 
         # After timeout (10 seconds later), transitions to HALF_OPEN
         t_after = t0 + timedelta(seconds=10)
-        assert cb.check_execution_allowed(current_time=t_after) is True
+        assert cb.can_attempt_probe(current_time=t_after) is True
         assert cb.get_state(current_time=t_after) == CircuitBreakerState.HALF_OPEN
 
     def test_half_open_success_resets_to_closed(self):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        cb = CircuitBreaker(target="gateway_test", failure_threshold=2, recovery_timeout_seconds=10.0, half_open_success_threshold=2)
+        cb = CircuitBreaker(target="gateway_test", failure_threshold=2, recovery_timeout_seconds=10.0, half_open_success_threshold=2, half_open_max_probes=2)
 
         cb.record_failure(current_time=t0)
         cb.record_failure(current_time=t0)
 
         t_recovery = t0 + timedelta(seconds=11)
-        assert cb.acquire_execution_permission(current_time=t_recovery) is True
+        assert cb.check_execution_allowed(current_time=t_recovery) is True
 
         # First trial success in HALF_OPEN
         cb.record_success(current_time=t_recovery)
         assert cb.get_state(current_time=t_recovery) == CircuitBreakerState.HALF_OPEN
 
         # Second trial success restores CLOSED
-        assert cb.acquire_execution_permission(current_time=t_recovery) is True
+        assert cb.check_execution_allowed(current_time=t_recovery) is True
         cb.record_success(current_time=t_recovery)
         assert cb.get_state(current_time=t_recovery) == CircuitBreakerState.CLOSED
         assert cb.check_execution_allowed() is True
@@ -110,7 +113,7 @@ class TestCircuitBreaker:
         cb.record_failure(current_time=t0)
 
         t_recovery = t0 + timedelta(seconds=11)
-        assert cb.acquire_execution_permission(current_time=t_recovery) is True
+        assert cb.check_execution_allowed(current_time=t_recovery) is True
         assert cb.get_state(current_time=t_recovery) == CircuitBreakerState.HALF_OPEN
 
         # Trial failure immediately trips back to OPEN
@@ -132,11 +135,10 @@ class TestCircuitBreaker:
 
 
 class TestHalfOpenConcurrencyAndProbeControl:
-    """Deterministic concurrency tests for HALF_OPEN probe admission and saturation."""
+    """Deterministic concurrency tests proving check_execution_allowed() atomically limits HALF_OPEN probes."""
 
-    def test_half_open_strictly_limits_concurrent_probes(self):
+    def test_check_execution_allowed_atomically_limits_concurrent_probes(self):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        # Breaker with half_open_max_probes=1
         cb = CircuitBreaker(
             target="concurrent_probe_test",
             failure_threshold=1,
@@ -155,12 +157,12 @@ class TestHalfOpenConcurrencyAndProbeControl:
 
         def probe_attempt(caller_id: int):
             try:
-                cb.acquire_execution_permission(current_time=t_recovery)
+                cb.check_execution_allowed(current_time=t_recovery)
                 admitted.append(caller_id)
             except CircuitBrokenError:
                 rejected.append(caller_id)
 
-        # 20 concurrent threads attempt to acquire execution permission during HALF_OPEN
+        # 20 concurrent threads attempt check_execution_allowed() during HALF_OPEN
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = [executor.submit(probe_attempt, i) for i in range(20)]
             for f in futures:
@@ -174,8 +176,8 @@ class TestHalfOpenConcurrencyAndProbeControl:
         cb.record_success(current_time=t_recovery)
         assert cb.get_state(current_time=t_recovery) == CircuitBreakerState.CLOSED
 
-        # Now all subsequent requests can acquire permission normally
-        assert cb.acquire_execution_permission(current_time=t_recovery) is True
+        # Now all subsequent requests can pass check_execution_allowed normally
+        assert cb.check_execution_allowed(current_time=t_recovery) is True
 
     def test_half_open_probe_failure_trips_to_open_and_blocks_all(self):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -188,12 +190,12 @@ class TestHalfOpenConcurrencyAndProbeControl:
         cb.record_failure(current_time=t0)
         t_recovery = t0 + timedelta(seconds=11)
 
-        # 1 probe admitted
-        assert cb.acquire_execution_permission(current_time=t_recovery) is True
+        # 1 probe admitted via check_execution_allowed
+        assert cb.check_execution_allowed(current_time=t_recovery) is True
 
         # Second concurrent probe is blocked
         with pytest.raises(CircuitBrokenError):
-            cb.acquire_execution_permission(current_time=t_recovery)
+            cb.check_execution_allowed(current_time=t_recovery)
 
         # Admitted probe fails
         cb.record_failure(current_time=t_recovery)
@@ -209,15 +211,15 @@ class TestHalfOpenConcurrencyAndProbeControl:
         cb.record_failure(current_time=t0)
         t_recovery = t0 + timedelta(seconds=11)
 
-        assert cb.acquire_execution_permission(current_time=t_recovery) is True
+        assert cb.check_execution_allowed(current_time=t_recovery) is True
         with pytest.raises(CircuitBrokenError):
-            cb.acquire_execution_permission(current_time=t_recovery)
+            cb.check_execution_allowed(current_time=t_recovery)
 
         # Probe is aborted without success/failure
         cb.release_probe()
 
         # Another probe can now be admitted
-        assert cb.acquire_execution_permission(current_time=t_recovery) is True
+        assert cb.check_execution_allowed(current_time=t_recovery) is True
 
 
 class TestCapacityGovernorAtomicity:
