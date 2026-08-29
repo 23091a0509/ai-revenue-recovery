@@ -2,9 +2,10 @@
 
 Architecture Baseline: Frozen Architecture Baseline v11.
 Proves technical egress boundary enforcement, production domain rejection,
-IP literal blocking, deceptive userinfo rejection, and fail-closed error handling.
+IP literal blocking, deceptive userinfo rejection, DNS resolution, and anti-rebinding defense.
 """
 
+from unittest.mock import MagicMock
 import pytest
 
 from src.revenue_recovery.executor import (
@@ -20,9 +21,20 @@ class TestSandboxGuardProtocolAndSchemeEnforcement:
 
     @pytest.fixture
     def guard(self) -> SandboxGuard:
-        return SandboxGuard()
+        return SandboxGuard(dns_resolver=lambda host, port: ["127.0.0.1"])
 
-    @pytest.mark.parametrize("valid_url", [
+    @pytest.mark.parametrize("loopback_url", [
+        "http://localhost",
+        "http://localhost:8001",
+        "https://localhost:8443/payments/charge",
+        "http://127.0.0.1:8001/v1/charge",
+        "https://127.0.0.1:8002/v1/send",
+        "http://[::1]:8001/status",
+    ])
+    def test_default_loopback_endpoints_pass(self, loopback_url: str):
+        assert validate_egress_url(loopback_url) is True
+
+    @pytest.mark.parametrize("valid_sandbox_url", [
         "http://localhost",
         "http://localhost:8001",
         "https://localhost:8443/payments/charge",
@@ -32,10 +44,9 @@ class TestSandboxGuardProtocolAndSchemeEnforcement:
         "http://sandbox-simulator:8001",
         "http://payments.sandbox:8001",
     ])
-    def test_allowed_sandbox_endpoints_pass(self, guard: SandboxGuard, valid_url: str):
-        assert guard.check_egress_allowed(valid_url) is True
-        assert guard.is_url_allowed(valid_url) is True
-        assert validate_egress_url(valid_url) is True
+    def test_allowed_sandbox_endpoints_pass(self, guard: SandboxGuard, valid_sandbox_url: str):
+        assert guard.check_egress_allowed(valid_sandbox_url) is True
+        assert guard.is_url_allowed(valid_sandbox_url) is True
 
     @pytest.mark.parametrize("bad_scheme_url", [
         "ftp://localhost:8001/file",
@@ -148,11 +159,58 @@ class TestSandboxGuardAdversarialAndDeceptiveAttacks:
         assert guard.is_url_allowed(public_ip_url) is False
 
 
+class TestDnsResolutionAndAntiRebinding:
+    """Deterministic security tests for DNS resolution verification and rebinding protection."""
+
+    def test_allowed_hostname_resolving_to_loopback_is_permitted(self):
+        mock_resolver = MagicMock(return_value=["127.0.0.1"])
+        guard = SandboxGuard(dns_resolver=mock_resolver)
+        assert guard.check_egress_allowed("http://sandbox-simulator:8001/status") is True
+        mock_resolver.assert_called_once_with("sandbox-simulator", 8001)
+
+    def test_allowed_hostname_resolving_to_public_ip_fails_closed(self):
+        # Adversary controls DNS for allowed name and returns public IP (DNS Rebinding)
+        mock_resolver = MagicMock(return_value=["93.184.216.34"])
+        guard = SandboxGuard(dns_resolver=mock_resolver)
+        with pytest.raises(SandboxViolationError, match="DNS rebinding / security violation"):
+            guard.check_egress_allowed("http://sandbox-simulator:8001/charge")
+
+    def test_allowed_hostname_resolving_to_rfc1918_private_ip_fails_closed(self):
+        mock_resolver = MagicMock(return_value=["192.168.1.50"])
+        guard = SandboxGuard(dns_resolver=mock_resolver)
+        with pytest.raises(SandboxViolationError, match="DNS rebinding / security violation"):
+            guard.check_egress_allowed("http://payments.sandbox:8001/charge")
+
+    def test_allowed_hostname_with_multi_record_dns_fails_if_any_ip_is_non_loopback(self):
+        # Multiple A records: one loopback, one malicious public IP
+        mock_resolver = MagicMock(return_value=["127.0.0.1", "203.0.113.195"])
+        guard = SandboxGuard(dns_resolver=mock_resolver)
+        with pytest.raises(SandboxViolationError, match="DNS rebinding / security violation"):
+            guard.check_egress_allowed("http://sandbox-simulator:8001/charge")
+
+    def test_dns_resolution_failure_fails_closed(self):
+        def failing_resolver(host: str, port: int):
+            raise RuntimeError("DNS Name Not Found (NXDOMAIN)")
+
+        guard = SandboxGuard(dns_resolver=failing_resolver)
+        with pytest.raises(SandboxViolationError, match="DNS resolution failed"):
+            guard.check_egress_allowed("http://sandbox-simulator:8001/charge")
+
+    def test_dns_resolution_empty_records_fails_closed(self):
+        mock_resolver = MagicMock(return_value=[])
+        guard = SandboxGuard(dns_resolver=mock_resolver)
+        with pytest.raises(SandboxViolationError, match="DNS resolution returned zero records"):
+            guard.check_egress_allowed("http://sandbox-simulator:8001/charge")
+
+
 class TestSandboxGuardCustomConfiguration:
     """Tests custom allowed hosts and forbidden domain additions."""
 
     def test_custom_allowed_hosts(self):
-        custom_guard = SandboxGuard(custom_allowed_hosts=["internal-mock-gateway.local"])
+        custom_guard = SandboxGuard(
+            custom_allowed_hosts=["internal-mock-gateway.local"],
+            dns_resolver=lambda host, port: ["127.0.0.1"]
+        )
         assert custom_guard.check_egress_allowed("http://internal-mock-gateway.local:9000/charge") is True
         assert custom_guard.check_egress_allowed("http://localhost:8001") is True
 
