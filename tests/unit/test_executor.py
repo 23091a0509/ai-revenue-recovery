@@ -4,7 +4,7 @@ Architecture Baseline: Frozen Architecture Baseline v11.
 Enforces:
 - INV-03: Capability-based Action Authorization
 - INV-04: Executor acts ONLY on valid signed token (strict independent request-to-token scope binding)
-- INV-05: Strict MVP Sandbox Isolation (via integrated SandboxGuard)
+- INV-05: Strict MVP Sandbox Isolation (via integrated SandboxGuard evaluated before capacity reservation)
 - INV-16: Idempotency across execution and retry
 """
 
@@ -555,10 +555,11 @@ class TestExecutorSafetyGatesAndShortCircuit:
 
         mock_handler.assert_not_called()
 
-    def test_sandbox_egress_firewall_blocks_production_url(
+    def test_sandbox_egress_firewall_blocks_production_url_without_consuming_capacity(
         self,
         executor: ActionExecutor,
         authorizer: CryptographicAuthorizer,
+        capacity_governor: CapacityGovernor,
         mock_handler: MagicMock,
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -594,6 +595,11 @@ class TestExecutorSafetyGatesAndShortCircuit:
             )
 
         mock_handler.assert_not_called()
+
+        # Proves zero capacity was consumed
+        count, vol = capacity_governor.get_current_utilization(current_time=t0)
+        assert count == 0
+        assert vol == 0
 
 
 class TestExecutorIdempotencyAndConcurrency:
@@ -653,6 +659,58 @@ class TestExecutorIdempotencyAndConcurrency:
 
         # Audit log has only 1 execution entry
         assert len(audit_logger.entries) == 1
+
+    def test_failed_execution_returns_failed_result_and_records_idempotency(
+        self,
+        executor: ActionExecutor,
+        authorizer: CryptographicAuthorizer,
+        mock_handler: MagicMock,
+        circuit_breakers: GranularCircuitBreakerRegistry,
+    ):
+        # Simulator returns a 402 Insufficient Funds / Decline failure
+        mock_handler.return_value = {
+            "status": "FAILED",
+            "http_status": 402,
+            "error": "card_declined_insufficient_funds",
+        }
+
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        token = authorizer.mint_authorization(
+            case_id="case_fail_1",
+            action_type=ActionType.RETRY_CHARGE,
+            customer_id="cust_fail_1",
+            max_amount_in_cents=5000,
+            currency="INR",
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            policy_version="v1.0",
+            decision_id="dec_fail_1",
+            expires_at=t0 + timedelta(minutes=5),
+            idempotency_key="idemp_failed_key_150",
+            current_time=t0,
+        )
+        request = ExecutionRequest(
+            case_id="case_fail_1",
+            customer_id="cust_fail_1",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=5000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_failed_key_150",
+        )
+
+        res1 = executor.execute_action(request=request, token=token, current_time=t0)
+        assert res1.status == ExecutionStatus.FAILED
+        assert res1.error_message == "card_declined_insufficient_funds"
+
+        # Duplicate retry with the same key returns the cached failed result without re-executing
+        res2 = executor.execute_action(request=request, token=token, current_time=t0 + timedelta(seconds=5))
+        assert res2 == res1
+        assert mock_handler.call_count == 1
+
+        # Circuit breaker recorded the failure
+        breaker = circuit_breakers.get_or_create(ActionChannel.DIRECT_PAYMENT_GATEWAY)
+        assert breaker._consecutive_failures == 1
 
     def test_replay_with_conflicting_parameters_fails_closed(
         self,

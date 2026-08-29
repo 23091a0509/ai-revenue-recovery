@@ -4,7 +4,7 @@ Architecture Baseline: Frozen Architecture Baseline v11.
 Enforces:
 - INV-03: Capability-based Action Authorization
 - INV-04: Executor acts ONLY on valid signed token (strict independent request-to-token scope binding)
-- INV-05: Strict MVP Sandbox Isolation (via integrated SandboxGuard)
+- INV-05: Strict MVP Sandbox Isolation (via integrated SandboxGuard evaluated before capacity reservation)
 - INV-16: Idempotency across execution and retry
 """
 
@@ -103,10 +103,10 @@ class ActionExecutor:
         2. Idempotency pre-check (replay return or conflict detection)
         3. Kill switch gate (Global, Channel, Action, Customer, Case)
         4. Circuit breaker gate (State check and half-open probe reservation)
-        5. Capacity governor gate (Count and monetary volume rate limits)
-        6. Sandbox egress firewall (Scheme, Userinfo, Domain, IP, DNS rebinding)
-        7. Action dispatch to Sandbox simulator
-        8. Audit logging and Idempotency store commit
+        5. Sandbox egress firewall (Scheme, Userinfo, Domain, IP, DNS rebinding)
+        6. Capacity governor gate (Count and monetary volume rate limits)
+        7. Action dispatch to Sandbox simulator (Updates circuit breaker health)
+        8. Audit logging and Idempotency store commit (Returns ExecutionResult)
         """
         now = current_time or datetime.now(timezone.utc)
 
@@ -170,7 +170,12 @@ class ActionExecutor:
             )
 
             # -----------------------------------------------------------------
-            # GATE 5: Capacity Governor Gate
+            # GATE 5: Sandbox URL Egress Firewall (Evaluated BEFORE Capacity Reservation)
+            # -----------------------------------------------------------------
+            self._sandbox_guard.check_egress_allowed(request.destination_url)
+
+            # -----------------------------------------------------------------
+            # GATE 6: Capacity Governor Gate
             # -----------------------------------------------------------------
             self._capacity_governor.record_action(
                 amount_in_cents=request.amount_in_cents,
@@ -178,18 +183,19 @@ class ActionExecutor:
             )
 
             # -----------------------------------------------------------------
-            # GATE 6: Sandbox URL Egress Firewall
-            # -----------------------------------------------------------------
-            self._sandbox_guard.check_egress_allowed(request.destination_url)
-
-            # -----------------------------------------------------------------
             # GATE 7: Action Dispatch to Sandbox Simulator
             # -----------------------------------------------------------------
             try:
                 raw_response = self._sandbox_handler(request.channel, request.destination_url, request.action_payload)
-                status = ExecutionStatus.SUCCESS
-                error_msg = None
-                self._circuit_breakers.record_success(request.channel, current_time=now)
+                # Check response payload for simulator error status
+                if isinstance(raw_response, dict) and raw_response.get("status") in ("FAILED", "ERROR", "DECLINED"):
+                    status = ExecutionStatus.FAILED
+                    error_msg = raw_response.get("error") or raw_response.get("message") or "Simulator returned failure"
+                    self._circuit_breakers.record_failure(request.channel, current_time=now)
+                else:
+                    status = ExecutionStatus.SUCCESS
+                    error_msg = None
+                    self._circuit_breakers.record_success(request.channel, current_time=now)
             except Exception as exc:
                 self._circuit_breakers.record_failure(request.channel, current_time=now)
                 status = ExecutionStatus.FAILED
@@ -232,8 +238,5 @@ class ActionExecutor:
                 },
                 timestamp=now,
             )
-
-            if status == ExecutionStatus.FAILED and error_msg:
-                raise RuntimeError(f"Sandbox action execution failed: {error_msg}")
 
             return result
