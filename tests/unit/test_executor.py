@@ -1,10 +1,11 @@
-"""Unit and security tests for Idempotent Action Executor (TICKET-10).
+"""Unit, security, and idempotency tests for ActionExecutor (TICKET-10).
 
 Architecture Baseline: Frozen Architecture Baseline v11.
 Enforces:
 - INV-03: Capability-based Action Authorization
-- INV-04: Executor acts ONLY on valid signed token
+- INV-04: Executor acts ONLY on valid signed token (strict independent request-to-token scope binding)
 - INV-05: Strict MVP Sandbox Isolation (via integrated SandboxGuard)
+- INV-16: Idempotency across execution and retry
 """
 
 import concurrent.futures
@@ -31,6 +32,7 @@ from src.revenue_recovery.safety import (
 )
 from src.revenue_recovery.executor import (
     ActionExecutor,
+    ExecutionRequest,
     ExecutionResult,
     IdempotencyConflictError,
     IdempotencyStore,
@@ -138,11 +140,21 @@ class TestExecutorHealthyExecution:
             current_time=t0,
         )
 
-        result = executor.execute_action(
-            token=token,
-            requested_amount_in_cents=10000,
+        request = ExecutionRequest(
+            case_id="case_exec_001",
+            customer_id="cust_exec_001",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=10000,
+            currency="INR",
             destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_exec_001",
             action_payload={"invoice_id": "inv_001"},
+        )
+
+        result = executor.execute_action(
+            request=request,
+            token=token,
             current_time=t0,
         )
 
@@ -150,6 +162,7 @@ class TestExecutorHealthyExecution:
         assert result.status == ExecutionStatus.SUCCESS
         assert result.idempotency_key == "idemp_exec_001"
         assert result.case_id == "case_exec_001"
+        assert result.customer_id == "cust_exec_001"
         assert result.amount_in_cents == 10000
         assert result.response_payload["mock_charge_id"] == "ch_mock_12345"
 
@@ -167,6 +180,117 @@ class TestExecutorHealthyExecution:
         assert audit_entry.payload["case_id"] == "case_exec_001"
         assert audit_entry.payload["status"] == "SUCCESS"
         assert audit_entry.payload["token_signature"] == token.signature
+
+
+class TestExecutorIndependentRequestScopeBinding:
+    """Verifies that the Executor independently validates the request against the signed token."""
+
+    @pytest.fixture
+    def base_token(self, authorizer: CryptographicAuthorizer) -> ActionAuthorization:
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        return authorizer.mint_authorization(
+            case_id="case_valid_100",
+            action_type=ActionType.RETRY_CHARGE,
+            customer_id="cust_valid_100",
+            max_amount_in_cents=50000,
+            currency="INR",
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            policy_version="v1.0",
+            decision_id="dec_valid_100",
+            expires_at=t0 + timedelta(minutes=5),
+            idempotency_key="idemp_valid_100",
+            current_time=t0,
+        )
+
+    def test_mismatched_customer_id_rejected(self, executor: ActionExecutor, base_token: ActionAuthorization):
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        request = ExecutionRequest(
+            case_id="case_valid_100",
+            customer_id="cust_ATTACKER_200",  # Mismatch
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=10000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_valid_100",
+        )
+        with pytest.raises(AuthorizationVerificationError, match="Customer mismatch"):
+            executor.execute_action(request=request, token=base_token, current_time=t0)
+
+    def test_mismatched_currency_rejected(self, executor: ActionExecutor, base_token: ActionAuthorization):
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        request = ExecutionRequest(
+            case_id="case_valid_100",
+            customer_id="cust_valid_100",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=10000,
+            currency="USD",  # Mismatch
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_valid_100",
+        )
+        with pytest.raises(AuthorizationVerificationError, match="Currency mismatch"):
+            executor.execute_action(request=request, token=base_token, current_time=t0)
+
+    def test_mismatched_channel_rejected(self, executor: ActionExecutor, base_token: ActionAuthorization):
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        request = ExecutionRequest(
+            case_id="case_valid_100",
+            customer_id="cust_valid_100",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.SMS,  # Mismatch
+            amount_in_cents=10000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_valid_100",
+        )
+        with pytest.raises(AuthorizationVerificationError, match="Channel mismatch"):
+            executor.execute_action(request=request, token=base_token, current_time=t0)
+
+    def test_mismatched_case_id_rejected(self, executor: ActionExecutor, base_token: ActionAuthorization):
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        request = ExecutionRequest(
+            case_id="case_DIFFERENT_999",  # Mismatch
+            customer_id="cust_valid_100",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=10000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_valid_100",
+        )
+        with pytest.raises(AuthorizationVerificationError, match="Scope mismatch: Request case_id"):
+            executor.execute_action(request=request, token=base_token, current_time=t0)
+
+    def test_mismatched_action_type_rejected(self, executor: ActionExecutor, base_token: ActionAuthorization):
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        request = ExecutionRequest(
+            case_id="case_valid_100",
+            customer_id="cust_valid_100",
+            action_type=ActionType.OFFER_PAYMENT_PLAN,  # Mismatch
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=10000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_valid_100",
+        )
+        with pytest.raises(AuthorizationVerificationError, match="Scope mismatch: Request action_type"):
+            executor.execute_action(request=request, token=base_token, current_time=t0)
+
+    def test_mismatched_idempotency_key_rejected(self, executor: ActionExecutor, base_token: ActionAuthorization):
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        request = ExecutionRequest(
+            case_id="case_valid_100",
+            customer_id="cust_valid_100",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=10000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_DIFFERENT_999",  # Mismatch
+        )
+        with pytest.raises(AuthorizationVerificationError, match="Scope mismatch: Request idempotency_key"):
+            executor.execute_action(request=request, token=base_token, current_time=t0)
 
 
 class TestExecutorUnsignedOrTamperedTokenRejected:
@@ -195,12 +319,21 @@ class TestExecutorUnsignedOrTamperedTokenRejected:
         )
 
         tampered_token = token.model_copy(update={"signature": "0" * 64})
+        request = ExecutionRequest(
+            case_id="case_forged_1",
+            customer_id="cust_forged_1",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=5000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_forged_1",
+        )
 
         with pytest.raises(AuthorizationVerificationError, match="Cryptographic signature mismatch"):
             executor.execute_action(
+                request=request,
                 token=tampered_token,
-                requested_amount_in_cents=5000,
-                destination_url="http://localhost:8001/charge",
                 current_time=t0,
             )
 
@@ -228,13 +361,22 @@ class TestExecutorUnsignedOrTamperedTokenRejected:
             idempotency_key="idemp_exp_1",
             current_time=t0,
         )
+        request = ExecutionRequest(
+            case_id="case_exp_1",
+            customer_id="cust_exp_1",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=5000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_exp_1",
+        )
 
         t_after_expiry = t0 + timedelta(minutes=5)
         with pytest.raises(AuthorizationVerificationError, match="Token has expired"):
             executor.execute_action(
+                request=request,
                 token=token,
-                requested_amount_in_cents=5000,
-                destination_url="http://localhost:8001/charge",
                 current_time=t_after_expiry,
             )
 
@@ -260,13 +402,21 @@ class TestExecutorUnsignedOrTamperedTokenRejected:
             idempotency_key="idemp_bound_1",
             current_time=t0,
         )
+        request = ExecutionRequest(
+            case_id="case_bound_1",
+            customer_id="cust_bound_1",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=7000,  # Exceeds max 5000
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_bound_1",
+        )
 
-        # Attempt to execute 7000 cents when bound is 5000
         with pytest.raises(AuthorizationVerificationError, match="Requested amount .* exceeds authorized upper bound"):
             executor.execute_action(
+                request=request,
                 token=token,
-                requested_amount_in_cents=7000,
-                destination_url="http://localhost:8001/charge",
                 current_time=t0,
             )
 
@@ -297,14 +447,23 @@ class TestExecutorSafetyGatesAndShortCircuit:
             idempotency_key="idemp_ks_1",
             current_time=t0,
         )
+        request = ExecutionRequest(
+            case_id="case_ks_1",
+            customer_id="cust_ks_1",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=5000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_ks_1",
+        )
 
         kill_switch.activate_global(reason="Emergency freeze", activated_by="security_admin")
 
         with pytest.raises(KillSwitchActiveError, match="Execution halted by GLOBAL kill switch"):
             executor.execute_action(
+                request=request,
                 token=token,
-                requested_amount_in_cents=5000,
-                destination_url="http://localhost:8001/charge",
                 current_time=t0,
             )
 
@@ -331,15 +490,24 @@ class TestExecutorSafetyGatesAndShortCircuit:
             idempotency_key="idemp_cb_1",
             current_time=t0,
         )
+        request = ExecutionRequest(
+            case_id="case_cb_1",
+            customer_id="cust_cb_1",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=5000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_cb_1",
+        )
 
         circuit_breakers.record_failure(ActionChannel.DIRECT_PAYMENT_GATEWAY, current_time=t0)
         circuit_breakers.record_failure(ActionChannel.DIRECT_PAYMENT_GATEWAY, current_time=t0)
 
         with pytest.raises(CircuitBrokenError, match="is OPEN and blocking execution"):
             executor.execute_action(
+                request=request,
                 token=token,
-                requested_amount_in_cents=5000,
-                destination_url="http://localhost:8001/charge",
                 current_time=t0,
             )
 
@@ -367,12 +535,21 @@ class TestExecutorSafetyGatesAndShortCircuit:
             idempotency_key="idemp_cap_1",
             current_time=t0,
         )
+        request = ExecutionRequest(
+            case_id="case_cap_1",
+            customer_id="cust_cap_1",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=600000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_cap_1",
+        )
 
         with pytest.raises(CapacityExceededError, match="Monetary volume limit exceeded"):
             executor.execute_action(
+                request=request,
                 token=token,
-                requested_amount_in_cents=600000,
-                destination_url="http://localhost:8001/charge",
                 current_time=t0,
             )
 
@@ -398,12 +575,21 @@ class TestExecutorSafetyGatesAndShortCircuit:
             idempotency_key="idemp_firewall_1",
             current_time=t0,
         )
+        request = ExecutionRequest(
+            case_id="case_firewall_1",
+            customer_id="cust_firewall_1",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=5000,
+            currency="INR",
+            destination_url="https://api.stripe.com/v1/charges",
+            idempotency_key="idemp_firewall_1",
+        )
 
         with pytest.raises(SandboxViolationError, match="Production egress blocked"):
             executor.execute_action(
+                request=request,
                 token=token,
-                requested_amount_in_cents=5000,
-                destination_url="https://api.stripe.com/v1/charges",
                 current_time=t0,
             )
 
@@ -434,20 +620,28 @@ class TestExecutorIdempotencyAndConcurrency:
             idempotency_key="idemp_repeat_key_100",
             current_time=t0,
         )
+        request = ExecutionRequest(
+            case_id="case_idem_1",
+            customer_id="cust_idem_1",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=5000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_repeat_key_100",
+        )
 
         res1 = executor.execute_action(
+            request=request,
             token=token,
-            requested_amount_in_cents=5000,
-            destination_url="http://localhost:8001/charge",
             current_time=t0,
         )
         assert res1.status == ExecutionStatus.SUCCESS
 
-        # Second execution with exact same token and parameters
+        # Second execution with exact same request
         res2 = executor.execute_action(
+            request=request,
             token=token,
-            requested_amount_in_cents=5000,
-            destination_url="http://localhost:8001/charge",
             current_time=t0 + timedelta(seconds=10),
         )
 
@@ -479,11 +673,20 @@ class TestExecutorIdempotencyAndConcurrency:
             idempotency_key="idemp_conflict_key_200",
             current_time=t0,
         )
+        req1 = ExecutionRequest(
+            case_id="case_conflict_1",
+            customer_id="cust_conflict_1",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=5000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_conflict_key_200",
+        )
 
         executor.execute_action(
+            request=req1,
             token=token1,
-            requested_amount_in_cents=5000,
-            destination_url="http://localhost:8001/charge",
             current_time=t0,
         )
 
@@ -500,12 +703,21 @@ class TestExecutorIdempotencyAndConcurrency:
             idempotency_key="idemp_conflict_key_200",  # Same key, different case_id
             current_time=t0,
         )
+        req2_conflicting = ExecutionRequest(
+            case_id="case_DIFFERENT_2",
+            customer_id="cust_conflict_1",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=5000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_conflict_key_200",
+        )
 
         with pytest.raises(IdempotencyConflictError, match="Conflicting re-execution rejected"):
             executor.execute_action(
+                request=req2_conflicting,
                 token=token2_conflicting,
-                requested_amount_in_cents=5000,
-                destination_url="http://localhost:8001/charge",
                 current_time=t0,
             )
 
@@ -529,12 +741,21 @@ class TestExecutorIdempotencyAndConcurrency:
             idempotency_key="idemp_race_key_300",
             current_time=t0,
         )
+        request = ExecutionRequest(
+            case_id="case_race_1",
+            customer_id="cust_race_1",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=5000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_race_key_300",
+        )
 
         def run_execution():
             return executor.execute_action(
+                request=request,
                 token=token,
-                requested_amount_in_cents=5000,
-                destination_url="http://localhost:8001/charge",
                 current_time=t0,
             )
 

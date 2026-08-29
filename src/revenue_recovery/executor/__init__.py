@@ -5,10 +5,13 @@ Provides sandbox egress firewall, authoritative idempotent action executor, and 
 
 from src.revenue_recovery.executor.executor import (
     ActionExecutor,
+    SandboxActionHandler,
+)
+from src.revenue_recovery.executor.idempotency import (
+    ExecutionRequest,
     ExecutionResult,
     IdempotencyConflictError,
     IdempotencyStore,
-    SandboxActionHandler,
 )
 from src.revenue_recovery.executor.sandbox_guard import (
     EgressVerdict,
@@ -19,6 +22,7 @@ from src.revenue_recovery.executor.sandbox_guard import (
 
 __all__ = [
     "ActionExecutor",
+    "ExecutionRequest",
     "ExecutionResult",
     "IdempotencyConflictError",
     "IdempotencyStore",

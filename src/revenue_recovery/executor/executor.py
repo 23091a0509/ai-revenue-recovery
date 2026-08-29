@@ -3,23 +3,20 @@
 Architecture Baseline: Frozen Architecture Baseline v11.
 Enforces:
 - INV-03: Capability-based Action Authorization
-- INV-04: Executor acts ONLY on valid signed token
+- INV-04: Executor acts ONLY on valid signed token (strict independent request-to-token scope binding)
 - INV-05: Strict MVP Sandbox Isolation (via integrated SandboxGuard)
+- INV-16: Idempotency across execution and retry
 """
 
 from datetime import datetime, timezone
-import hashlib
-import json
 import threading
 from typing import Any, Callable, Dict, Optional
-from pydantic import BaseModel, Field
 
 from src.revenue_recovery.foundation.audit import CryptographicAuditLogger
 from src.revenue_recovery.foundation.events import (
     ActionChannel,
     ActionType,
     ExecutionStatus,
-    ImmutableBaseModel,
 )
 from src.revenue_recovery.safety.authorizer import (
     ActionAuthorization,
@@ -36,52 +33,16 @@ from src.revenue_recovery.safety.kill_switch import (
     KillSwitchActiveError,
     KillSwitchManager,
 )
+from src.revenue_recovery.executor.idempotency import (
+    ExecutionRequest,
+    ExecutionResult,
+    IdempotencyConflictError,
+    IdempotencyStore,
+)
 from src.revenue_recovery.executor.sandbox_guard import (
     SandboxGuard,
     SandboxViolationError,
 )
-
-
-class IdempotencyConflictError(ValueError):
-    """Raised when an idempotency key is reused with mismatched / conflicting parameters."""
-    pass
-
-
-class ExecutionResult(ImmutableBaseModel):
-    """Immutable outcome of an action execution."""
-    idempotency_key: str
-    case_id: str
-    action_type: ActionType
-    channel: ActionChannel
-    amount_in_cents: int
-    destination_url: str
-    status: ExecutionStatus
-    response_payload: Dict[str, Any] = Field(default_factory=dict)
-    error_message: Optional[str] = None
-    executed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-class IdempotencyStore:
-    """Thread-safe in-memory idempotency store preventing duplicate side-effects."""
-
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._records: Dict[str, ExecutionResult] = {}
-        self._in_flight: Dict[str, threading.Event] = {}
-
-    def get(self, idempotency_key: str) -> Optional[ExecutionResult]:
-        with self._lock:
-            return self._records.get(idempotency_key)
-
-    def record(self, result: ExecutionResult) -> None:
-        with self._lock:
-            self._records[result.idempotency_key] = result
-
-    def clear(self) -> None:
-        with self._lock:
-            self._records.clear()
-            self._in_flight.clear()
-
 
 # Type alias for sandbox execution handler: (channel, destination_url, payload) -> Dict[str, Any]
 SandboxActionHandler = Callable[[ActionChannel, str, Dict[str, Any]], Dict[str, Any]]
@@ -129,15 +90,16 @@ class ActionExecutor:
 
     def execute_action(
         self,
+        request: ExecutionRequest,
         token: ActionAuthorization,
-        requested_amount_in_cents: int,
-        destination_url: str,
-        action_payload: Optional[Dict[str, Any]] = None,
         current_time: Optional[datetime] = None,
     ) -> ExecutionResult:
         """
-        Executes a recovery action under strict 8-step short-circuit safety enforcement:
-        1. Token verification (Cryptographic signature, TTL, bounds, channel)
+        Executes an independent recovery action request under strict 8-step safety enforcement:
+        1. Cryptographic Authorization Verification & Request Scope Binding:
+           - Validates signature and TTL
+           - Binds request.customer_id, request.currency, request.amount_in_cents, request.channel
+           - Binds request.case_id, request.action_type, request.idempotency_key against token
         2. Idempotency pre-check (replay return or conflict detection)
         3. Kill switch gate (Global, Channel, Action, Customer, Case)
         4. Circuit breaker gate (State check and half-open probe reservation)
@@ -147,36 +109,43 @@ class ActionExecutor:
         8. Audit logging and Idempotency store commit
         """
         now = current_time or datetime.now(timezone.utc)
-        payload = action_payload or {}
 
         # ---------------------------------------------------------------------
-        # GATE 1: Cryptographic Authorization Verification
+        # GATE 1: Cryptographic Authorization Verification & Request Scope Binding
         # ---------------------------------------------------------------------
+        # 1a. Validate cryptographic HMAC signature, expiration, customer, currency, amount bound, channel
         self._authorizer.verify_authorization(
             token=token,
-            expected_customer_id=token.customer_id,
-            expected_currency=token.currency,
-            requested_amount_in_cents=requested_amount_in_cents,
-            expected_channel=token.channel,
+            expected_customer_id=request.customer_id,
+            expected_currency=request.currency,
+            requested_amount_in_cents=request.amount_in_cents,
+            expected_channel=request.channel,
             current_time=now,
         )
+
+        # 1b. Validate additional independent request fields against authorized token
+        if token.case_id != request.case_id:
+            raise AuthorizationVerificationError(
+                f"Scope mismatch: Request case_id '{request.case_id}' does not match authorized token case_id '{token.case_id}'"
+            )
+        if token.action_type != request.action_type:
+            raise AuthorizationVerificationError(
+                f"Scope mismatch: Request action_type '{request.action_type}' does not match authorized token action_type '{token.action_type}'"
+            )
+        if token.idempotency_key != request.idempotency_key:
+            raise AuthorizationVerificationError(
+                f"Scope mismatch: Request idempotency_key '{request.idempotency_key}' does not match authorized token idempotency_key '{token.idempotency_key}'"
+            )
 
         with self._execution_lock:
             # -----------------------------------------------------------------
             # GATE 2: Idempotency Pre-Check
             # -----------------------------------------------------------------
-            existing_record = self._idempotency_store.get(token.idempotency_key)
+            existing_record = self._idempotency_store.get(request.idempotency_key)
             if existing_record is not None:
-                # Validate exact parameter match
-                if (
-                    existing_record.case_id != token.case_id
-                    or existing_record.action_type != token.action_type
-                    or existing_record.channel != token.channel
-                    or existing_record.amount_in_cents != requested_amount_in_cents
-                    or existing_record.destination_url != destination_url
-                ):
+                if not existing_record.matches_request(request):
                     raise IdempotencyConflictError(
-                        f"Idempotency key '{token.idempotency_key}' was already processed with different parameters. "
+                        f"Idempotency key '{request.idempotency_key}' was already processed with different parameters. "
                         "Conflicting re-execution rejected."
                     )
                 # Idempotent replay: return existing result without re-executing
@@ -186,17 +155,17 @@ class ActionExecutor:
             # GATE 3: Kill Switch Gate
             # -----------------------------------------------------------------
             self._kill_switch.check_execution_allowed(
-                action_type=token.action_type,
-                channel=token.channel,
-                customer_id=token.customer_id,
-                case_id=token.case_id,
+                action_type=request.action_type,
+                channel=request.channel,
+                customer_id=request.customer_id,
+                case_id=request.case_id,
             )
 
             # -----------------------------------------------------------------
             # GATE 4: Circuit Breaker Gate
             # -----------------------------------------------------------------
             self._circuit_breakers.check_execution_allowed(
-                target=token.channel,
+                target=request.channel,
                 current_time=now,
             )
 
@@ -204,36 +173,38 @@ class ActionExecutor:
             # GATE 5: Capacity Governor Gate
             # -----------------------------------------------------------------
             self._capacity_governor.record_action(
-                amount_in_cents=requested_amount_in_cents,
+                amount_in_cents=request.amount_in_cents,
                 current_time=now,
             )
 
             # -----------------------------------------------------------------
             # GATE 6: Sandbox URL Egress Firewall
             # -----------------------------------------------------------------
-            self._sandbox_guard.check_egress_allowed(destination_url)
+            self._sandbox_guard.check_egress_allowed(request.destination_url)
 
             # -----------------------------------------------------------------
             # GATE 7: Action Dispatch to Sandbox Simulator
             # -----------------------------------------------------------------
             try:
-                raw_response = self._sandbox_handler(token.channel, destination_url, payload)
+                raw_response = self._sandbox_handler(request.channel, request.destination_url, request.action_payload)
                 status = ExecutionStatus.SUCCESS
                 error_msg = None
-                self._circuit_breakers.record_success(token.channel, current_time=now)
+                self._circuit_breakers.record_success(request.channel, current_time=now)
             except Exception as exc:
-                self._circuit_breakers.record_failure(token.channel, current_time=now)
+                self._circuit_breakers.record_failure(request.channel, current_time=now)
                 status = ExecutionStatus.FAILED
                 error_msg = str(exc)
                 raw_response = {"error": str(exc)}
 
             result = ExecutionResult(
-                idempotency_key=token.idempotency_key,
-                case_id=token.case_id,
-                action_type=token.action_type,
-                channel=token.channel,
-                amount_in_cents=requested_amount_in_cents,
-                destination_url=destination_url,
+                idempotency_key=request.idempotency_key,
+                case_id=request.case_id,
+                customer_id=request.customer_id,
+                action_type=request.action_type,
+                channel=request.channel,
+                amount_in_cents=request.amount_in_cents,
+                currency=request.currency,
+                destination_url=request.destination_url,
                 status=status,
                 response_payload=raw_response,
                 error_message=error_msg,
@@ -249,9 +220,11 @@ class ActionExecutor:
                 payload={
                     "idempotency_key": result.idempotency_key,
                     "case_id": result.case_id,
+                    "customer_id": result.customer_id,
                     "action_type": str(result.action_type),
                     "channel": str(result.channel),
                     "amount_in_cents": result.amount_in_cents,
+                    "currency": result.currency,
                     "destination_url": result.destination_url,
                     "status": str(result.status),
                     "token_signature": token.signature,
