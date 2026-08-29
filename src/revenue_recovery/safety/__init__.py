@@ -8,6 +8,12 @@ from src.revenue_recovery.safety.authorizer import (
     canonical_signing_string,
     validate_authorizer_signing_secret,
 )
+from src.revenue_recovery.safety.kill_switch import (
+    KillSwitchActiveError,
+    KillSwitchManager,
+    KillSwitchRecord,
+    KillSwitchScope,
+)
 
 __all__ = [
     "ActionAuthorization",
@@ -16,4 +22,8 @@ __all__ = [
     "CryptographicAuthorizer",
     "canonical_signing_string",
     "validate_authorizer_signing_secret",
+    "KillSwitchActiveError",
+    "KillSwitchManager",
+    "KillSwitchRecord",
+    "KillSwitchScope",
 ]
