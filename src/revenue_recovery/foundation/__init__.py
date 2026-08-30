@@ -23,6 +23,7 @@ from src.revenue_recovery.foundation.config import (
 from src.revenue_recovery.foundation.events import (
     ActionChannel,
     ActionType,
+    CaseDiagnosedEvent,
     CaseState,
     ComplianceObligation,
     DomainEventEnvelope,
@@ -58,6 +59,7 @@ __all__ = [
     "PaymentFailureEvent",
     "RecoveryCase",
     "ComplianceObligation",
+    "CaseDiagnosedEvent",
     "DomainEventEnvelope",
     # Cryptographic Audit
     "GENESIS_PREVIOUS_HASH",

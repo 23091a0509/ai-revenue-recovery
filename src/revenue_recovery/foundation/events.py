@@ -149,6 +149,16 @@ class ComplianceObligation(ImmutableBaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class CaseDiagnosedEvent(ImmutableBaseModel):
+    """Event emitted upon completion of deterministic failure diagnosis."""
+    event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    case_id: str = Field(min_length=1)
+    diagnosis_code: str = Field(min_length=1)
+    risk_score: float = Field(ge=0.0, le=1.0)
+    recommended_channel: ActionChannel
+    occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 # ============================================================================
 # Generic Domain Event Envelope
 # ============================================================================
