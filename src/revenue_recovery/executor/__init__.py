@@ -19,6 +19,13 @@ from src.revenue_recovery.executor.sandbox_guard import (
     SandboxViolationError,
     validate_egress_url,
 )
+from src.revenue_recovery.executor.simulators import (
+    MessagingSimulationResult,
+    MockMessagingSimulator,
+    MockPaymentSimulator,
+    PaymentSimulationResult,
+    create_sandbox_action_handler,
+)
 
 __all__ = [
     "ActionExecutor",
@@ -31,4 +38,9 @@ __all__ = [
     "SandboxGuard",
     "SandboxViolationError",
     "validate_egress_url",
+    "MessagingSimulationResult",
+    "MockMessagingSimulator",
+    "MockPaymentSimulator",
+    "PaymentSimulationResult",
+    "create_sandbox_action_handler",
 ]
