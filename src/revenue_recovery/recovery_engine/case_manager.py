@@ -6,6 +6,7 @@ Enforces:
 - Strict transition guards, terminal state locking, and attempt bounding.
 - Thread-safe concurrency control for atomic state mutations.
 - Monotonic timestamp advancement and cryptographic audit logging.
+- INV-09: Safety freezes cannot be bypassed via arbitrary state jumping.
 """
 
 from datetime import datetime, timezone
@@ -46,7 +47,8 @@ class CaseFrozenError(CaseError):
     pass
 
 
-# Explicit Allowed Transitions Table (v11 Baseline)
+# Authoritative Allowed Transitions Table (v11 Baseline)
+# Enforces strict unidirectional recovery progression and guarded safety recovery
 ALLOWED_TRANSITIONS: Dict[CaseState, Set[CaseState]] = {
     CaseState.OPEN: {
         CaseState.DIAGNOSED,
@@ -70,24 +72,23 @@ ALLOWED_TRANSITIONS: Dict[CaseState, Set[CaseState]] = {
     },
     CaseState.EXECUTING: {
         CaseState.RECONCILING,
-        CaseState.SCHEDULED,
-        CaseState.ABANDONED,
-        CaseState.FROZEN,
+        CaseState.SCHEDULED,   # Retry path when attempt_count < max_attempts
+        CaseState.ABANDONED,   # Failure when attempt_count >= max_attempts
+        CaseState.FROZEN,      # Safety trip during execution
     },
     CaseState.RECONCILING: {
-        CaseState.RESOLVED,
-        CaseState.SCHEDULED,
-        CaseState.ABANDONED,
-        CaseState.FROZEN,
+        CaseState.RESOLVED,    # Settlement confirmed
+        CaseState.SCHEDULED,   # Settlement failed, retry scheduled
+        CaseState.ABANDONED,   # Settlement failed, max attempts exhausted
+        CaseState.FROZEN,      # Safety trip during reconciliation
     },
     CaseState.FROZEN: {
-        CaseState.OPEN,
+        # INV-09: Unfreezing MUST re-enter through DIAGNOSED for complete governance re-evaluation,
+        # or terminate as ABANDONED. Direct jumps to SCHEDULED/EXECUTING are forbidden.
         CaseState.DIAGNOSED,
-        CaseState.EVALUATING,
-        CaseState.SCHEDULED,
         CaseState.ABANDONED,
     },
-    # Terminal states have no allowed outbound transitions
+    # Terminal states have zero allowed outbound transitions
     CaseState.RESOLVED: set(),
     CaseState.ABANDONED: set(),
 }
@@ -281,12 +282,14 @@ class CaseManager:
     def unfreeze_case(
         self,
         case_id: str,
-        target_state: CaseState,
-        reason: str,
+        target_state: CaseState = CaseState.DIAGNOSED,
+        reason: str = "",
         current_time: Optional[datetime] = None,
     ) -> RecoveryCase:
         """
-        Unfreezes a previously FROZEN case to an operable state after safety clearance.
+        Unfreezes a previously FROZEN case. Per INV-09, unfreezing strictly re-enters
+        through DIAGNOSED (for complete governance and safety re-evaluation) or ABANDONED.
+        Direct jumps from FROZEN to SCHEDULED or EXECUTING are forbidden.
         """
         current_case = self.get_case(case_id)
         if current_case is None:
@@ -295,6 +298,12 @@ class CaseManager:
         if current_case.state != CaseState.FROZEN:
             state_val = current_case.state.value if hasattr(current_case.state, 'value') else str(current_case.state)
             raise CaseError(f"Case '{case_id}' is not in FROZEN state (current: '{state_val}')")
+
+        if target_state not in {CaseState.DIAGNOSED, CaseState.ABANDONED}:
+            raise InvalidStateTransitionError(
+                f"INV-09 Guard: Cannot unfreeze case '{case_id}' directly to '{target_state.value}'. "
+                f"Unfreezing must transition to DIAGNOSED for governance re-evaluation or ABANDONED."
+            )
 
         return self.transition_case(
             case_id=case_id,

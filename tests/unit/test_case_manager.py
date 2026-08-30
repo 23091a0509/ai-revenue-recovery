@@ -6,6 +6,7 @@ Enforces:
 - Strict transition guards, terminal state locking, and attempt bounding.
 - Thread-safe concurrency control for atomic state mutations.
 - Monotonic timestamp advancement and cryptographic audit logging.
+- INV-09: Safety freezes cannot be bypassed via arbitrary state jumping.
 """
 
 import concurrent.futures
@@ -292,7 +293,11 @@ class TestSafetyFreezeAndUnfreeze:
         with pytest.raises(InvalidStateTransitionError, match="is not permitted"):
             case_manager.transition_case(case.case_id, CaseState.EXECUTING)
 
-        # Unfreeze back to DIAGNOSED
+        # Direct unfreeze jump to SCHEDULED/EXECUTING is forbidden per INV-09
+        with pytest.raises(InvalidStateTransitionError, match="INV-09 Guard: Cannot unfreeze case .* directly"):
+            case_manager.unfreeze_case(case.case_id, target_state=CaseState.SCHEDULED)
+
+        # Unfreeze must strictly re-enter through DIAGNOSED
         c_unfrozen = case_manager.unfreeze_case(
             case.case_id,
             target_state=CaseState.DIAGNOSED,
@@ -300,7 +305,7 @@ class TestSafetyFreezeAndUnfreeze:
         )
         assert c_unfrozen.state == CaseState.DIAGNOSED
 
-        # Case can now proceed to EVALUATING
+        # Case can now proceed cleanly to EVALUATING
         c_eval = case_manager.transition_case(case.case_id, CaseState.EVALUATING)
         assert c_eval.state == CaseState.EVALUATING
 
