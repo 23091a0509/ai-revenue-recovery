@@ -1,4 +1,4 @@
-"""Unit, security, and idempotency tests for ActionExecutor (TICKET-10).
+"""Unit, security, and idempotency tests for ActionExecutor (TICKET-10 & TICKET-12).
 
 Architecture Baseline: Frozen Architecture Baseline v11.
 Enforces:
@@ -18,6 +18,7 @@ from src.revenue_recovery.foundation.events import (
     ActionChannel,
     ActionType,
     ExecutionStatus,
+    FailureReason,
 )
 from src.revenue_recovery.safety import (
     ActionAuthorization,
@@ -36,8 +37,11 @@ from src.revenue_recovery.executor import (
     ExecutionResult,
     IdempotencyConflictError,
     IdempotencyStore,
+    MockMessagingSimulator,
+    MockPaymentSimulator,
     SandboxGuard,
     SandboxViolationError,
+    create_sandbox_action_handler,
 )
 
 
@@ -829,3 +833,178 @@ class TestExecutorIdempotencyAndConcurrency:
 
         # Handler was dispatched EXACTLY ONCE
         assert mock_handler.call_count == 1
+
+
+class TestExecutorIntegratedRealSimulatorPipeline:
+    """
+    End-to-End Milestone 3 Integration Tests.
+    Exercises real ActionExecutor -> real create_sandbox_action_handler -> real MockPaymentSimulator
+    and MockMessagingSimulator components without mock handlers.
+    """
+
+    @pytest.fixture
+    def payment_simulator(self, sandbox_guard: SandboxGuard) -> MockPaymentSimulator:
+        return MockPaymentSimulator(sandbox_guard=sandbox_guard)
+
+    @pytest.fixture
+    def messaging_simulator(self, sandbox_guard: SandboxGuard) -> MockMessagingSimulator:
+        return MockMessagingSimulator(sandbox_guard=sandbox_guard)
+
+    @pytest.fixture
+    def integrated_executor(
+        self,
+        authorizer: CryptographicAuthorizer,
+        kill_switch: KillSwitchManager,
+        circuit_breakers: GranularCircuitBreakerRegistry,
+        capacity_governor: CapacityGovernor,
+        sandbox_guard: SandboxGuard,
+        audit_logger: CryptographicAuditLogger,
+        idempotency_store: IdempotencyStore,
+        payment_simulator: MockPaymentSimulator,
+        messaging_simulator: MockMessagingSimulator,
+    ) -> ActionExecutor:
+        real_handler = create_sandbox_action_handler(
+            payment_simulator=payment_simulator,
+            messaging_simulator=messaging_simulator,
+            sandbox_guard=sandbox_guard,
+        )
+        return ActionExecutor(
+            authorizer=authorizer,
+            kill_switch=kill_switch,
+            circuit_breakers=circuit_breakers,
+            capacity_governor=capacity_governor,
+            sandbox_guard=sandbox_guard,
+            audit_logger=audit_logger,
+            idempotency_store=idempotency_store,
+            sandbox_handler=real_handler,
+        )
+
+    def test_integrated_payment_charge_execution_and_replay(
+        self,
+        integrated_executor: ActionExecutor,
+        authorizer: CryptographicAuthorizer,
+        payment_simulator: MockPaymentSimulator,
+        audit_logger: CryptographicAuditLogger,
+    ):
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        token = authorizer.mint_authorization(
+            case_id="case_int_pay_01",
+            action_type=ActionType.RETRY_CHARGE,
+            customer_id="cust_int_01",
+            max_amount_in_cents=35000,
+            currency="INR",
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            policy_version="v1.0",
+            decision_id="dec_int_01",
+            expires_at=t0 + timedelta(minutes=5),
+            idempotency_key="idemp_int_pay_01",
+            current_time=t0,
+        )
+        request = ExecutionRequest(
+            case_id="case_int_pay_01",
+            customer_id="cust_int_01",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=35000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_int_pay_01",
+            action_payload={"invoice_id": "inv_int_01", "amount_in_cents": 35000, "currency": "INR"},
+        )
+
+        res1 = integrated_executor.execute_action(request=request, token=token, current_time=t0)
+        assert res1.status == ExecutionStatus.SUCCESS
+        assert res1.response_payload["charge_id"].startswith("ch_mock_")
+        assert len(payment_simulator.history) == 1
+
+        # Replay with same key returns cached result and does NOT invoke simulator again
+        res2 = integrated_executor.execute_action(request=request, token=token, current_time=t0 + timedelta(seconds=10))
+        assert res2 == res1
+        assert len(payment_simulator.history) == 1
+        assert len(audit_logger.entries) == 1
+
+    def test_integrated_payment_insufficient_funds_failure_and_circuit_health(
+        self,
+        integrated_executor: ActionExecutor,
+        authorizer: CryptographicAuthorizer,
+        payment_simulator: MockPaymentSimulator,
+        circuit_breakers: GranularCircuitBreakerRegistry,
+    ):
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        payment_simulator.set_scenario_override("inv_int_fail_02", "INSUFFICIENT_FUNDS")
+
+        token = authorizer.mint_authorization(
+            case_id="case_int_pay_02",
+            action_type=ActionType.RETRY_CHARGE,
+            customer_id="cust_int_02",
+            max_amount_in_cents=20000,
+            currency="INR",
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            policy_version="v1.0",
+            decision_id="dec_int_02",
+            expires_at=t0 + timedelta(minutes=5),
+            idempotency_key="idemp_int_pay_02",
+            current_time=t0,
+        )
+        request = ExecutionRequest(
+            case_id="case_int_pay_02",
+            customer_id="cust_int_02",
+            action_type=ActionType.RETRY_CHARGE,
+            channel=ActionChannel.DIRECT_PAYMENT_GATEWAY,
+            amount_in_cents=20000,
+            currency="INR",
+            destination_url="http://localhost:8001/charge",
+            idempotency_key="idemp_int_pay_02",
+            action_payload={"invoice_id": "inv_int_fail_02", "amount_in_cents": 20000, "currency": "INR"},
+        )
+
+        res = integrated_executor.execute_action(request=request, token=token, current_time=t0)
+        assert res.status == ExecutionStatus.FAILED
+        assert res.response_payload["http_status"] == 402
+        assert res.response_payload["failure_code"] == FailureReason.INSUFFICIENT_FUNDS.value
+
+        # Breaker recorded the failure
+        breaker = circuit_breakers.get_or_create(ActionChannel.DIRECT_PAYMENT_GATEWAY)
+        assert breaker._consecutive_failures == 1
+
+    def test_integrated_messaging_dispatch_across_channels(
+        self,
+        integrated_executor: ActionExecutor,
+        authorizer: CryptographicAuthorizer,
+        messaging_simulator: MockMessagingSimulator,
+    ):
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        channels = [ActionChannel.EMAIL, ActionChannel.SMS, ActionChannel.WHATSAPP]
+
+        for i, ch in enumerate(channels):
+            token = authorizer.mint_authorization(
+                case_id=f"case_int_msg_{i}",
+                action_type=ActionType.SEND_NOTIFICATION,
+                customer_id=f"cust_msg_{i}",
+                max_amount_in_cents=1,
+                currency="INR",
+                channel=ch,
+                policy_version="v1.0",
+                decision_id=f"dec_msg_{i}",
+                expires_at=t0 + timedelta(minutes=5),
+                idempotency_key=f"idemp_msg_{i}",
+                current_time=t0,
+            )
+            request = ExecutionRequest(
+                case_id=f"case_int_msg_{i}",
+                customer_id=f"cust_msg_{i}",
+                action_type=ActionType.SEND_NOTIFICATION,
+                channel=ch,
+                amount_in_cents=1,
+                currency="INR",
+                destination_url="http://localhost:8002/messages",
+                idempotency_key=f"idemp_msg_{i}",
+                action_payload={"recipient": f"user_{i}@sandbox.internal", "message_body": "Payment notice"},
+            )
+
+            res = integrated_executor.execute_action(request=request, token=token, current_time=t0)
+            assert res.status == ExecutionStatus.SUCCESS
+            assert res.response_payload["delivery_status"] == "DELIVERED"
+            assert res.response_payload["message_id"].startswith("msg_mock_")
+
+        assert len(messaging_simulator.history) == 3
