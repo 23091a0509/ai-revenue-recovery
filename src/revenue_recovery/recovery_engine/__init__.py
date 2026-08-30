@@ -13,6 +13,11 @@ from src.revenue_recovery.recovery_engine.case_manager import (
     InvalidStateTransitionError,
     MaxAttemptsExceededError,
 )
+from src.revenue_recovery.recovery_engine.diagnosis import (
+    DiagnosisResult,
+    RiskDiagnosisEvaluator,
+    evaluate_diagnosis,
+)
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
@@ -23,4 +28,7 @@ __all__ = [
     "CaseNotFoundError",
     "InvalidStateTransitionError",
     "MaxAttemptsExceededError",
+    "DiagnosisResult",
+    "RiskDiagnosisEvaluator",
+    "evaluate_diagnosis",
 ]
