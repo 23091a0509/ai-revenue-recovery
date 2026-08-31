@@ -9,10 +9,18 @@ from src.revenue_recovery.ai_decision.artifacts import (
     compute_canonical_input_hash,
     create_decision_artifact,
 )
+from src.revenue_recovery.ai_decision.engine import (
+    AIDecisionEngine,
+    AIModelProvider,
+    DeterministicAIProvider,
+)
 
 __all__ = [
     "DecisionArtifact",
     "DecisionArtifactCreatedEvent",
     "compute_canonical_input_hash",
     "create_decision_artifact",
+    "AIDecisionEngine",
+    "AIModelProvider",
+    "DeterministicAIProvider",
 ]
