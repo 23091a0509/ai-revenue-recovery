@@ -3,6 +3,16 @@
 Authoritative Baseline: Frozen Architecture Baseline v11.
 """
 
+from src.revenue_recovery.governance.arbitrator import (
+    ArbitratedOutcome,
+    ArbitrationEvaluatedEvent,
+    ArbitrationRecord,
+    ComplianceVerdict,
+    ControlPlaneArbitrator,
+    ExperimentAssignment,
+    SafetyVerdict,
+    compute_canonical_arbitration_hash,
+)
 from src.revenue_recovery.governance.policy_engine import (
     DEFAULT_STANDARD_POLICY,
     STANDARD_POLICY_RULES,
@@ -39,4 +49,13 @@ __all__ = [
     "ScheduledObligationPlan",
     "ObligationScheduledEvent",
     "ComplianceScheduler",
+    # Control-Plane Arbitrator
+    "SafetyVerdict",
+    "ComplianceVerdict",
+    "ExperimentAssignment",
+    "ArbitratedOutcome",
+    "ArbitrationRecord",
+    "ArbitrationEvaluatedEvent",
+    "ControlPlaneArbitrator",
+    "compute_canonical_arbitration_hash",
 ]
