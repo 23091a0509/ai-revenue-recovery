@@ -15,8 +15,15 @@ from src.revenue_recovery.governance.policy_engine import (
     RuleEvaluationResult,
     RuleTier,
 )
+from src.revenue_recovery.governance.scheduler import (
+    ComplianceScheduler,
+    ObligationScheduledEvent,
+    ObligationStatus,
+    ScheduledObligationPlan,
+)
 
 __all__ = [
+    # Policy Engine
     "PolicyLifecycleState",
     "RuleTier",
     "PolicyRule",
@@ -27,4 +34,9 @@ __all__ = [
     "STANDARD_POLICY_RULES",
     "DEFAULT_STANDARD_POLICY",
     "PolicyEngine",
+    # Compliance Scheduler
+    "ObligationStatus",
+    "ScheduledObligationPlan",
+    "ObligationScheduledEvent",
+    "ComplianceScheduler",
 ]
