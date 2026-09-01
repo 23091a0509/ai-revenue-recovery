@@ -141,7 +141,6 @@ class AIDecisionEngine:
             )
             self.audit_logger.append(
                 event_type="DECISION_ARTIFACT_CREATED",
-                entity_id=artifact.artifact_id,
                 payload=created_event.model_dump(mode="json"),
                 timestamp=now,
             )
