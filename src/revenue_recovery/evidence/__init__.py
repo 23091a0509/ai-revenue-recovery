@@ -3,6 +3,13 @@
 Authoritative Baseline: Frozen Architecture Baseline v11.
 """
 
+from src.revenue_recovery.evidence.evidence_engine import (
+    BlockingReason,
+    EvidenceCalculatedEvent,
+    EvidenceEngine,
+    EvidenceMetricEntry,
+    ReportingState,
+)
 from src.revenue_recovery.evidence.experiment import (
     ExperimentAssignmentRecord,
     ExperimentAssignedEvent,
@@ -19,4 +26,9 @@ __all__ = [
     "ExperimentAssignmentRecord",
     "ExperimentAssignedEvent",
     "ExperimentEngine",
+    "ReportingState",
+    "BlockingReason",
+    "EvidenceMetricEntry",
+    "EvidenceCalculatedEvent",
+    "EvidenceEngine",
 ]
